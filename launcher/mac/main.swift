@@ -75,10 +75,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
         let version = { (folder: URL) in (try? String(contentsOf: folder.appendingPathComponent("openviz-version.txt"), encoding: .utf8)) ?? "" }
         if !isOpenviz || version(carried) != version(target) {
-            // --noqtn: a downloaded app is in quarantine, and the programs Openviz runs must not inherit it.
+            // Without extended attributes: a downloaded app is in quarantine, and the programs Openviz
+            // runs from the copy must not inherit it (--noqtn alone keeps it when copying a folder).
             let copy = Process()
             copy.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-            copy.arguments = ["--noqtn", carried.path, target.path]
+            copy.arguments = ["--noextattr", "--noqtn", carried.path, target.path]
             do {
                 try copy.run()
                 copy.waitUntilExit()
