@@ -1,0 +1,25 @@
+# Unreal binary assets
+*.uasset filter=lfs diff=lfs merge=lfs -text
+*.umap   filter=lfs diff=lfs merge=lfs -text
+
+# Source art and media that ends up next to an Unreal project
+*.fbx filter=lfs diff=lfs merge=lfs -text
+*.exr filter=lfs diff=lfs merge=lfs -text
+*.hdr filter=lfs diff=lfs merge=lfs -text
+*.psd filter=lfs diff=lfs merge=lfs -text
+*.wav filter=lfs diff=lfs merge=lfs -text
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.mov filter=lfs diff=lfs merge=lfs -text
+
+# Text stays text with LF endings, so the repo is identical on the Windows/RTX machine
+*.md      text eol=lf
+*.py      text eol=lf
+*.h       text eol=lf
+*.cpp     text eol=lf
+*.cs      text eol=lf
+*.ini     text eol=lf
+*.uproject text eol=lf
+*.uplugin  text eol=lf
+
+# Windows start files keep the line endings Windows wants
+*.bat     text eol=crlf

@@ -1,0 +1,17 @@
+# Built on each computer, never kept in the repository.
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+*.sln
+.vs/
+/core/build/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Openviz keeps the shows, fixtures, settings and logs of whoever uses it here.
+/library/
+windows-check.txt
+.DS_Store
