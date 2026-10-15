@@ -1,5 +1,7 @@
 # Openviz
 
+**Download:** the Mac `.dmg` and the Windows `.exe` are on the [Releases page](https://github.com/YoshiBowman/Open-Viz/releases), under Assets of the newest release.
+
 A show-lighting visualizer built on Unreal Engine 5.8. A lighting console sends DMX (Art-Net or sACN) and Openviz shows the rig as it would look: beams in haze with gobos, prisms, framing and shadows, LED walls and video screens, set pieces.
 
 - Reads rigs as **MVR** (from grandMA3, Vectorworks, Capture and others) and fixture types as **GDTF**, with the fixtures' own 3D models, wheels, gobos and prisms. Finds and downloads fixtures from GDTF Share.
