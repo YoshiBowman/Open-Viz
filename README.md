@@ -10,16 +10,12 @@ The same folder runs on a Mac and on Windows: the visualizer is built on the com
 
 ## Installing: the easy way
 
-Both installers download the newest release from [Releases](https://github.com/YoshiBowman/Open-Viz/releases), check it against GitHub's checksum, put it in place and set it up. They ask before they install or change anything, and running one again updates Openviz and keeps your shows. Unreal Engine 5.8 itself comes from the Epic Games Launcher, signed in with your Epic account.
+Download the installer for your computer from the newest release on [Releases](https://github.com/YoshiBowman/Open-Viz/releases). Openviz also needs Unreal Engine 5.8, installed from the [Epic Games Launcher](https://store.epicgames.com/download) with your Epic account.
 
-- **Windows:** download `Install-Openviz-Windows.bat` from the newest release and double-click it. Windows may warn that it comes from the internet: More info, Run anyway. It offers to install Python, Visual Studio and the Epic Games Launcher with winget, puts Openviz in `C:\Openviz` (or where you say), builds it, and puts it in the Start menu.
-- **Mac:** download `Install-Openviz-Mac.zip` from the newest release, open it, and double-click `Install Openviz.command`. The first time, macOS may refuse it as coming from an unidentified developer: System Settings, Privacy & Security, Open Anyway. Or paste this into Terminal:
+- **Windows: `Openviz-<version>-Windows.exe`.** Run it. Windows may say it protected your PC from an unrecognised app: More info, Run anyway. Choose the folder (`C:\Openviz`), Install, and leave "Set Openviz up now" ticked: a window checks for Python, Visual Studio and Unreal Engine (and offers to install the first two and the Epic Games Launcher), builds Openviz and puts it in the Start menu. "Set up Openviz" in the Start menu does that again, for example once Unreal is installed. Openviz is removed in Settings, Apps, Installed apps; your shows are kept unless you say otherwise.
+- **Mac: `Openviz-<version>-Mac.dmg`.** Open it and drag Openviz to Applications, then open Openviz. The first time, macOS may say it cannot check the app: System Settings, Privacy & Security, Open Anyway. Openviz needs Xcode (step 1 below), as Unreal does. It keeps its shows and its own files in `~/Openviz`; a newer Openviz from a newer .dmg updates them and keeps your shows.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/YoshiBowman/Open-Viz/main/install/install-openviz.sh | sh
-```
-
-It needs Xcode (step 1 below) and offers to install CMake with Homebrew; it puts Openviz in `~/Openviz` (or where you say) and the app in Applications.
+The first time a show is watched, Openviz builds the visualizer: ten minutes to half an hour.
 
 The steps below do the same by hand.
 
