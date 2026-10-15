@@ -1,6 +1,8 @@
 // Openviz as a Mac app: a window around the page that launcher.py serves.
 // It starts launcher.py, shows its page, and stops it again when the window is closed.
-// Built by launcher/build_mac_app.sh.
+// Built by launcher/build_mac_app.sh, which writes down the project folder it was built from; or,
+// for the app in the .dmg on GitHub, by publish/publish.py, which puts the whole project inside
+// the app (Resources/Openviz) for it to set up in ~/Openviz.
 import Cocoa
 import WebKit
 
@@ -41,11 +43,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     // MARK: the server
 
-    private func startServer() {
-        guard let pathFile = Bundle.main.url(forResource: "repo-path", withExtension: "txt"),
-              let repo = try? String(contentsOf: pathFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) else {
-            return fail("This copy of the app is incomplete. Build it again with launcher/build_mac_app.sh.")
+    // The project folder: the one build_mac_app.sh wrote down, or the one this app carries, put in place.
+    private func projectFolder() -> String? {
+        if let pathFile = Bundle.main.url(forResource: "repo-path", withExtension: "txt"),
+           let repo = try? String(contentsOf: pathFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
+            return repo
         }
+        guard let carried = Bundle.main.resourceURL?.appendingPathComponent("Openviz"),
+              FileManager.default.fileExists(atPath: carried.appendingPathComponent("launcher/launcher.py").path) else {
+            fail("This copy of the app is incomplete. Download it again, or build it with launcher/build_mac_app.sh.")
+            return nil
+        }
+        return putInPlace(carried)
+    }
+
+    // The project this app carries goes to ~/Openviz (or OPENVIZ_FOLDER), and again whenever the app
+    // is a different version from what is there. What is copied over is only the app's own files: the
+    // library (shows, fixtures, settings) and what was built on this Mac stay.
+    private func putInPlace(_ carried: URL) -> String? {
+        let files = FileManager.default
+        let given = ProcessInfo.processInfo.environment["OPENVIZ_FOLDER"]
+        let target = URL(fileURLWithPath: given ?? files.homeDirectoryForCurrentUser.appendingPathComponent("Openviz").path)
+        if files.fileExists(atPath: target.appendingPathComponent(".git").path) {
+            return target.path    // a copy made with Git is brought up to date with git pull, not from here
+        }
+        let isOpenviz = files.fileExists(atPath: target.appendingPathComponent("launcher/launcher.py").path)
+        let others = ((try? files.contentsOfDirectory(atPath: target.path)) ?? []).filter { !$0.hasPrefix(".") }
+        if !isOpenviz && !others.isEmpty {
+            fail("Openviz keeps its shows and its own files in a folder called Openviz in your home folder, and \(target.path) already holds other things. Move or rename that folder, then open Openviz again.")
+            return nil
+        }
+        let version = { (folder: URL) in (try? String(contentsOf: folder.appendingPathComponent("openviz-version.txt"), encoding: .utf8)) ?? "" }
+        if !isOpenviz || version(carried) != version(target) {
+            // --noqtn: a downloaded app is in quarantine, and the programs Openviz runs must not inherit it.
+            let copy = Process()
+            copy.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            copy.arguments = ["--noqtn", carried.path, target.path]
+            do {
+                try copy.run()
+                copy.waitUntilExit()
+            } catch {
+                copy.terminate()
+            }
+            if copy.terminationStatus != 0 {
+                fail("Openviz could not be put in \(target.path). Is there room on the disk, and may it be written to?")
+                return nil
+            }
+        }
+        return target.path
+    }
+
+    private func startServer() {
+        // Openviz runs on the Python that comes with Xcode's tools, which Unreal Engine needs too.
+        let tools = Process()
+        tools.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        tools.arguments = ["-p"]
+        tools.standardOutput = FileHandle.nullDevice
+        tools.standardError = FileHandle.nullDevice
+        if (try? tools.run()) == nil || { tools.waitUntilExit(); return tools.terminationStatus != 0 }() {
+            return fail("Openviz needs Xcode, as Unreal Engine does on a Mac. Install Xcode from the App Store or developer.apple.com, open it once, then open Openviz again.")
+        }
+        guard let repo = projectFolder() else { return }
         let script = repo + "/launcher/launcher.py"
         let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs")
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)

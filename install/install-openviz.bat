@@ -148,6 +148,16 @@ try {
         Say '           Then run this installer again: it builds the visualizer once Unreal is there.'
     }
 
+    # Run from inside an Openviz folder (as the .exe installer does at its end), this sets that one up.
+    $self = $env:OPENVIZ_INSTALLER
+    $here = $(if ($self) { Split-Path -Parent (Split-Path -Parent $self) } else { '' })
+    $inPlace = $here -and (Test-Path -LiteralPath (Join-Path $here 'launcher\launcher.py'))
+    if ($inPlace) {
+        $dest = $here; $updating = $false
+        $tag = 'in ' + $here
+        $versionFile = Join-Path $here 'openviz-version.txt'
+        if (Test-Path -LiteralPath $versionFile) { $tag = (Get-Content -Raw -LiteralPath $versionFile).Trim() }
+    } else {
     Step '2. Where Openviz goes'
     $dest = Ask 'Install Openviz in C:\Openviz? Press Enter, or type another folder' 'C:\Openviz'
     $dest = [IO.Path]::GetFullPath($dest)
@@ -199,8 +209,9 @@ try {
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
+    }
 
-    Step '5. Openviz''s own setup'
+    Step $(if ($inPlace) { '2. Openviz''s own setup' } else { '5. Openviz''s own setup' })
     Say 'It builds the core and the visualizer (ten minutes to half an hour the first time), puts Openviz in the Start menu and on the desktop, and checks this PC.'
     $arguments = $python.Args + @('-X', 'utf8', (Join-Path $dest 'launcher\windows_setup.py'))
     if (-not $unreal) { $arguments += '--skip-unreal' }
@@ -209,7 +220,7 @@ try {
     $setupCode = $LASTEXITCODE
 
     Step 'Done'
-    if ($updating) { Say "Openviz is updated to $tag, in $dest." } else { Say "Openviz $tag is installed in $dest." }
+    if ($inPlace) { Say "Openviz $tag is set up in $dest." } elseif ($updating) { Say "Openviz is updated to $tag, in $dest." } else { Say "Openviz $tag is installed in $dest." }
     if (-not $unreal) { Say 'Install Unreal Engine 5.8 in the Epic Games Launcher, then run this installer again to build the visualizer.' }
     elseif ($setupCode -ne 0) { Say 'The setup did not finish everything: what it listed under "What came of it" says what to put right; then run this installer again.' }
     $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Openviz.lnk'
