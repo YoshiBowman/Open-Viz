@@ -6,7 +6,22 @@ A show-lighting visualizer built on Unreal Engine 5.8. A lighting console sends 
 - Patch lists, fixture types swapped in for a console's placeholders, set pieces (decks, truss, drapes, model files), screens showing pictures, films, NDI streams or DMX pixels.
 - Light plots and paperwork as PDF, MVR export, MVR-xchange with the console, OSC remote control, DMX recording and playback, video recording and rendering.
 
-The same folder runs on a Mac and on Windows: the visualizer is built on the computer it runs on, by the steps below.
+The same folder runs on a Mac and on Windows: the visualizer is built on the computer it runs on.
+
+## Installing: the easy way
+
+Both installers download the newest release from [Releases](https://github.com/YoshiBowman/Open-Viz/releases), check it against GitHub's checksum, put it in place and set it up. They ask before they install or change anything, and running one again updates Openviz and keeps your shows. Unreal Engine 5.8 itself comes from the Epic Games Launcher, signed in with your Epic account.
+
+- **Windows:** download `Install-Openviz-Windows.bat` from the newest release and double-click it. Windows may warn that it comes from the internet: More info, Run anyway. It offers to install Python, Visual Studio and the Epic Games Launcher with winget, puts Openviz in `C:\Openviz` (or where you say), builds it, and puts it in the Start menu.
+- **Mac:** download `Install-Openviz-Mac.zip` from the newest release, open it, and double-click `Install Openviz.command`. The first time, macOS may refuse it as coming from an unidentified developer: System Settings, Privacy & Security, Open Anyway. Or paste this into Terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YoshiBowman/Open-Viz/main/install/install-openviz.sh | sh
+```
+
+It needs Xcode (step 1 below) and offers to install CMake with Homebrew; it puts Openviz in `~/Openviz` (or where you say) and the app in Applications.
+
+The steps below do the same by hand.
 
 ## On a Mac
 
@@ -73,7 +88,7 @@ Openviz has been used on a Mac; on Windows it has not yet been run on a real PC,
 
 ## Updating
 
-In the Openviz folder, `git pull`, then open Openviz again: it rebuilds the visualizer by itself when its code has changed. On Windows, run `launcher\setup_windows.bat` again as well.
+Run the installer again. Or, for a copy made with Git: in the Openviz folder, `git pull`, then open Openviz again; it rebuilds the visualizer by itself when its code has changed. On Windows, run `launcher\setup_windows.bat` again as well.
 
 ## Using it
 
