@@ -107,12 +107,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let script = repo + "/launcher/launcher.py"
         let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs")
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
-        let logURL = logs.appendingPathComponent("OpenvizLauncher.log")
+        // OPENVIZ_LOG and OPENVIZ_LAUNCHER_ARGS are for trying a copy of the app beside the one in use
+        // (publish/publish.py's checks): another log, and launcher options such as --no-relay.
+        let given = ProcessInfo.processInfo.environment
+        let logURL = given["OPENVIZ_LOG"].map { URL(fileURLWithPath: $0) } ?? logs.appendingPathComponent("OpenvizLauncher.log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["python3", script, "--no-open", "--verbose", "--parent", String(ProcessInfo.processInfo.processIdentifier)]
+            + (given["OPENVIZ_LAUNCHER_ARGS"] ?? "").split(separator: " ").map(String.init)
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
         process.environment = environment
