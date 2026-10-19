@@ -90,7 +90,7 @@ Run the installer again. Or, for a copy made with Git: in the Openviz folder, `g
 
 ## Using it
 
-Drop an MVR file on the Openviz window to add a show (grandMA3: Menu, Patch, Export, MVR; Vectorworks: File, Export, Export MVR), then **Watch live** to see it under the console's DMX, or **Edit in Unreal Editor** to move and re-patch fixtures. In the visualizer, hold the right mouse button to look around, W A S D to fly, the number keys for stored views. Openviz keeps shows, fixtures and settings in `library/` inside its folder.
+Drop an MVR file on the Openviz window to add a show (grandMA3: Menu › Patch › Export, as MVR; Vectorworks: File › Export › Export MVR), then **Watch Live** to see it under the console's DMX. Open a show for its own page: edit the patch and fixture positions in the **Patch** tab, replace a console's placeholder fixture types in **Fixture Types**, build the stage in **Set Pieces**, set up **Screens**, and export the light plot and paperwork from **Paperwork**. **Open in Unreal Editor** moves fixtures with the mouse. In the visualizer, hold the right mouse button to look around, W A S D to fly, and the number keys for stored views. Openviz keeps shows, fixtures and settings in `library/` inside its folder.
 
 ## Licence
 

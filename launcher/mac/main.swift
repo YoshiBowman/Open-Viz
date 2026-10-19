@@ -15,11 +15,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 780),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 820),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Openviz"
-        window.minSize = NSSize(width: 560, height: 480)
-        window.backgroundColor = NSColor(red: 0.07, green: 0.075, blue: 0.086, alpha: 1)
+        window.minSize = NSSize(width: 720, height: 520)
+        window.backgroundColor = NSColor(red: 0.047, green: 0.051, blue: 0.063, alpha: 1)    // the page's --bg, #0c0d10
         window.center()
         window.setFrameAutosaveName("Launcher")
 

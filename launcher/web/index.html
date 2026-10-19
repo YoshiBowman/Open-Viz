@@ -10,70 +10,59 @@
 <body>
 <div class="frame">
   <aside>
-    <div class="brand"><img class="logo" src="icon.png" alt="" width="30" height="30">Openviz</div>
-    <nav aria-label="Sections">
-      <button data-view="shows" class="tab">Shows</button>
-      <button data-view="fixtures" class="tab">Fixtures</button>
-      <button data-view="dmx" class="tab">DMX</button>
-      <button data-view="picture" class="tab">Picture</button>
-      <button data-view="parity" class="tab">Parity</button>
-      <button data-view="engine" class="tab low">Engine <span id="engine-dot" class="dot"></span></button>
-    </nav>
+    <div class="brand"><img class="logo" src="icon.png" alt="" width="28" height="28"><span class="name">Openviz</span><span class="version" id="version"></span></div>
+    <nav id="nav" aria-label="Sections"></nav>
   </aside>
 
   <main>
-    <section id="view-shows" hidden>
-      <h1>Shows</h1>
-      <div id="drop" class="drop" tabindex="0" role="button" aria-label="Add an MVR or GDTF file">
-        <strong>Drop an MVR file here</strong>
-        <span>or click to choose one. GDTF fixture files work too.</span>
-        <input id="file" type="file" accept=".mvr,.gdtf" multiple hidden>
-      </div>
-      <details class="how">
-        <summary>How to get an MVR file out of grandMA3 or Vectorworks</summary>
-        <p>Their own show files (.show, .vwx) are closed formats that cannot be read here. Both export the rig as MVR, an open format that carries the fixtures, their positions, their patch and the fixture types.</p>
-        <p><b>grandMA3:</b> Menu, then Patch. Press Export at the bottom, leave the file type on MVR and press Export. The file lands in grandMA3's <code>gma3_library/mvr</code> folder, and is offered below once it is there.</p>
-        <p><b>Vectorworks Spotlight:</b> File, Export, Export MVR.</p>
-      </details>
-      <div id="shows-notice"></div>
-      <div id="found"></div>
-      <div id="xchange"></div>
-      <h2>Your shows</h2>
-      <p class="muted">Watch live opens the visualizer, a window for watching the rig under DMX. Edit in Unreal Editor is where fixtures are moved and re-patched; what you change there is kept with the show and appears in the visualizer.</p>
-      <div id="shows" class="list"></div>
-    </section>
+    <section id="view-shows" hidden><div class="page" id="shows-page"></div></section>
+    <section id="view-show" hidden><div class="page wide" id="show-page"></div></section>
 
-    <section id="view-fixtures" hidden>
-      <h1>Fixtures</h1>
-      <div class="searchbar">
-        <input id="q" type="search" placeholder="Search GDTF Share: fixture or manufacturer" autocomplete="off" spellcheck="false">
-        <span id="share-status" class="muted"></span>
-      </div>
-      <form id="login" class="panel" hidden>
-        <h3>Log in to GDTF Share</h3>
-        <p class="muted" id="login-why"></p>
-        <div class="row">
-          <label>User name <input id="user" type="text" autocomplete="username" spellcheck="false"></label>
-          <label>Password <input id="password" type="password" autocomplete="current-password"></label>
-          <button class="primary" type="submit">Log in</button>
+    <section id="view-library" hidden>
+      <div class="page">
+        <div class="page-head">
+          <div class="lead"><h1>Fixture Library</h1><div class="subtitle">GDTF fixture types for your shows, downloaded from GDTF Share or added as files.</div></div>
+          <div class="actions"><button id="reveal-fixtures" class="subtle">Show Folder</button></div>
         </div>
-        <label id="remember-row" class="check"><input id="remember" type="checkbox"><span id="remember-words"> Stay logged in on this Mac</span></label>
-        <p class="muted">Sent only to gdtf-share.com. With Stay logged in ticked, the password is kept in <span id="remember-where">the macOS Keychain, where your other passwords are</span>, and Openviz logs in by itself from then on. Without it, nothing is saved and you stay logged in until Openviz quits. No account yet? Sign up free at gdtf-share.com.</p>
-      </form>
-      <div id="fixtures-notice"></div>
-      <div id="results" class="list"></div>
-      <h2>In your library <button id="reveal-fixtures" class="link">Show folder</button></h2>
-      <div id="library" class="list"></div>
+        <div class="card">
+          <div class="card-head">
+            <h3>GDTF Share</h3>
+            <span id="share-status" class="sub"></span>
+          </div>
+          <div class="card-body">
+            <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+              <input id="q" type="search" placeholder="Search by fixture or manufacturer" autocomplete="off" spellcheck="false" aria-label="Search GDTF Share"></div>
+            <form id="login" hidden>
+              <h4>Sign in to GDTF Share</h4>
+              <p class="help" id="login-why"></p>
+              <div class="fields">
+                <label class="field"><span>User name</span><input id="user" type="text" autocomplete="username" spellcheck="false"></label>
+                <label class="field"><span>Password</span><input id="password" type="password" autocomplete="current-password"></label>
+                <button class="primary" type="submit">Sign In</button>
+              </div>
+              <label id="remember-row" class="check"><input id="remember" type="checkbox"><span id="remember-words">Stay signed in on this Mac</span></label>
+              <p class="help">Your password is sent only to gdtf-share.com. With “Stay signed in”, it is kept in <span id="remember-where">the macOS Keychain</span> and Openviz signs in automatically; otherwise nothing is saved. No account? Register free at gdtf-share.com.</p>
+            </form>
+            <div id="fixtures-notice"></div>
+            <div id="results" class="list"></div>
+          </div>
+        </div>
+        <h2>In Your Library</h2>
+        <div id="library" class="list"></div>
+      </div>
     </section>
 
-    <section id="view-dmx" hidden><h1>DMX</h1><div id="dmx"></div></section>
-    <section id="view-picture" hidden><h1>Picture</h1><div id="picture"></div></section>
-    <section id="view-parity" hidden><h1>Parity with Depence and Capture</h1><div id="parity"></div></section>
-    <section id="view-engine" hidden><h1>Engine</h1><div id="engine"></div></section>
+    <section id="view-dmx" hidden><div class="page" id="dmx"></div></section>
+    <section id="view-recordings" hidden><div class="page" id="recordings"></div></section>
+    <section id="view-connections" hidden><div class="page" id="connections"></div></section>
+    <section id="view-visualizer" hidden><div class="page" id="visualizer"></div></section>
+    <section id="view-system" hidden><div class="page" id="system"></div></section>
+    <section id="view-parity" hidden><div class="page" id="parity"></div></section>
   </main>
 </div>
 
 <footer id="runbar" hidden></footer>
+<input id="file" type="file" accept=".mvr,.gdtf,.openviz,.glb,.3ds,.obj" multiple hidden>
 <script src="app.js"></script>
 </body>
 </html>
