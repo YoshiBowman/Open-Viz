@@ -44,6 +44,7 @@ add_library(vizcore STATIC
     src/mvr.cpp
     src/mvr_export.cpp
     src/pieces.cpp
+    src/psn.cpp
     src/rig.cpp
     src/screens.cpp
     src/show_edits.cpp
@@ -66,7 +67,7 @@ endif()
 target_compile_options(vizcore PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${VIZCORE_NO_EXCEPTIONS}>)
 # Warnings as errors for our own sources only.
 set_source_files_properties(
-    src/archive.cpp src/dmx_recording.cpp src/evaluate.cpp src/fixture_state.cpp src/gdtf.cpp src/image.cpp src/json.cpp src/mesh.cpp src/movie.cpp src/mvr.cpp src/mvr_export.cpp src/pieces.cpp src/rig.cpp src/screens.cpp src/show_edits.cpp src/text.cpp src/types.cpp
+    src/archive.cpp src/dmx_recording.cpp src/evaluate.cpp src/fixture_state.cpp src/gdtf.cpp src/image.cpp src/json.cpp src/mesh.cpp src/movie.cpp src/mvr.cpp src/mvr_export.cpp src/pieces.cpp src/psn.cpp src/rig.cpp src/screens.cpp src/show_edits.cpp src/text.cpp src/types.cpp
     PROPERTIES COMPILE_OPTIONS "${VIZCORE_WARNINGS}")
 
 if(VIZCORE_BUILD_TOOLS)
@@ -96,6 +97,7 @@ if(VIZCORE_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/main.cpp")
         tests/test_mvr.cpp
         tests/test_mvr_export.cpp
         tests/test_pieces.cpp
+        tests/test_psn.cpp
         tests/test_reference.cpp
         tests/test_rig.cpp
         tests/test_screens.cpp

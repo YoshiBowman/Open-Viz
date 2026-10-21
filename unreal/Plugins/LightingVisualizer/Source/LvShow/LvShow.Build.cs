@@ -10,6 +10,7 @@ public class LvShow : ModuleRules
 
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
 		PrivateDependencyModuleNames.AddRange(new string[] { "LvFixtures", "VizCore", "InputCore", "Json", "Slate", "SlateCore",
-			"MovieSceneCapture", "ImageWrapper", "RenderCore", "RHI" });    // video: the engine's frame grabber, and JPEG
+			"MovieSceneCapture", "ImageWrapper", "RenderCore", "RHI",    // video: the engine's frame grabber, and JPEG
+			"Sockets" });    // PosiStageNet, as Openviz passes it on
 	}
 }

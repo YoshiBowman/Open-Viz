@@ -109,18 +109,24 @@ def title_of(show, edits):
 def read_plot(text):
     """What `vizcore_inspect --plot` printed, as
     {"types": {number: (low, high)}, "places": {uuid: (type number, placing)}, "objects": [...],
-    "beams": {uuid: [{"origin", "direction", "lumens", "beam", "field", "intensity", "kind"}, ...]}}.
+    "beams": {uuid: [{"origin", "direction", "lumens", "beam", "field", "intensity", "kind"}, ...]},
+    "outlines": {number: [(x, y, z), ...]}}: the points that outline a type from above, the front and the side.
     A beam is as it stands at rest with the dimmer full: where the light leaves (millimetres)
     and which way (a unit vector), its flux and its angles.
     A placing is twelve numbers: the three axes and the origin of an MVR matrix. An object is
     {"kind", "uuid", "name", "layer", "class", "boxes": [(placing, low, high)]}. "unplaced" counts the
     fixtures the rig file gives no place, which have no place and no beams here. Lines that are not
     as expected are passed over."""
-    types, places, objects, by_uuid, beams = {}, {}, [], {}, {}
+    types, places, objects, by_uuid, beams, outlines = {}, {}, [], {}, {}, {}
     unplaced = 0
     for line in text.splitlines():
         parts = line.split("\t")
         try:
+            if parts[0] == "points" and len(parts) >= 11 and (len(parts) - 2) % 3 == 0:
+                numbers = [float(part) for part in parts[2:]]
+                if all(math.isfinite(number) for number in numbers):
+                    outlines[int(parts[1])] = [tuple(numbers[k:k + 3]) for k in range(0, len(numbers), 3)]
+                continue
             if parts[0] == "unplaced" and len(parts) == 2:
                 unplaced = max(0, int(parts[1]))
                 continue
@@ -149,7 +155,7 @@ def read_plot(text):
                 by_uuid[parts[1]]["boxes"].append((numbers[:12], numbers[12:15], numbers[15:]))
         except ValueError:
             continue
-    return {"types": types, "places": places, "objects": objects, "beams": beams, "unplaced": unplaced}
+    return {"types": types, "places": places, "objects": objects, "beams": beams, "unplaced": unplaced, "outlines": outlines}
 
 
 def standing_screen(name, width, height, x, y, z, turn):
@@ -408,10 +414,13 @@ def rig_for_plot(fixtures, plot):
         if not on_stage(row) or not placed:
             continue
         low, high = plot["types"].get(placed[0], ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
+        outline = plot.get("outlines", {}).get(placed[0])
         if any(high[axis] - low[axis] < 1.0 for axis in range(3)):
             low, high = (-150.0, -150.0, -300.0), (150.0, 150.0, 0.0)    # its file gives no sizes: a box as big as a small fixture
-        drawn.append({"row": row, "placing": placed[1], "low": low, "high": high, "corners": corners(placed[1], low, high),
-                      "origin": placed[1][9:12]})
+            outline = None
+        # Its own outline where the file's models give one, so that it is drawn as it looks; else its box.
+        points = [place(placed[1], point) for point in outline] if outline else corners(placed[1], low, high)
+        drawn.append({"row": row, "placing": placed[1], "low": low, "high": high, "corners": points, "origin": placed[1][9:12]})
     return drawn
 
 

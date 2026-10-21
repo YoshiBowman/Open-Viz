@@ -42,6 +42,7 @@ import time
 import urllib.parse
 import webbrowser
 import zipfile
+import xml.etree.ElementTree as ET
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "tools", "gdtf_share"))
@@ -53,8 +54,10 @@ import verify_capture  # noqa: E402    (its Art-Net and sACN decoders read what 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dmx_record  # noqa: E402
+import fixture_builder  # noqa: E402
 import mvr_xchange  # noqa: E402
 import osc  # noqa: E402
+import psn  # noqa: E402
 import ndi_find  # noqa: E402
 import package  # noqa: E402
 import oslayer  # noqa: E402
@@ -97,6 +100,11 @@ DEFAULTS = {
     "beam_shadows": True,          # what stands in a beam cuts the part of it behind
     "adapt_beams": True,           # draw beams in haze at less detail by itself while the picture runs below 30 frames a second
     "rig_haze": True,              # fog and haze machines in the rig, driven by DMX, add to the haze
+    "floor": 0.8,                  # how rough the stage floor is: 0 a mirror, 1 matte
+    "floor_shade": 0.14,           # its colour, 0 black to 1 white
+    "bloom": 0.675,                # how far bright parts glow into what is around them (the engine's bloom; 0.675 its own)
+    "motion_blur": True,           # what moves fast is blurred along its path
+    "surface_colour": False,       # coloured gobos and split colours land in colour on surfaces (the engine's colour light-function atlas)
     "idle_look": True,             # light fixtures at their defaults until DMX arrives
     "preview_count": 6,
     "mouse_look": "hold",          # hold: the view turns while the right button is held; always: game style
@@ -112,6 +120,9 @@ DEFAULTS = {
     "xchange_uuid": "",            # this station's id, made once and kept
     "osc": False,                  # listen for OSC from a console or a control surface (views, pictures, exposure, haze)
     "osc_port": 8000,
+    "psn": False,                  # hear PosiStageNet: set pieces follow the trackers they are given
+    "psn_group": "236.10.10.10",   # the multicast group it comes to; empty: sent to this computer's own address
+    "psn_port": 56565,
 }
 
 # What to tell someone who drops a file this cannot read. The applications' own formats are
@@ -145,6 +156,11 @@ def editor_binary(engine):
 
 class PdfBytes(bytes):
     """An answer that is a PDF to look at, not JSON."""
+
+
+class PictureBytes(bytes):
+    """An answer that is a picture, not JSON: `content_type` says which kind."""
+    content_type = "image/png"
 
 
 MODEL_ENDINGS = (".glb", ".3ds", ".obj")
@@ -284,6 +300,7 @@ class Launcher:
         self.videos_dir = os.path.join(self.library, "videos")
         self.models_dir = os.path.join(self.library, "models")    # model files for set pieces: GLB, 3DS, OBJ
         self._videos = {}    # a movie the visualizer saved -> {"state", "file", "error"}: made into H.264 here
+        self._panoramas = {}    # the six views of a 360-degree picture -> {"state", "file", "error"}: stitched here
         self._monitor_path = os.path.join(self.logs_dir, "dmx-monitor.json")    # written by the relay
         self._control_path = os.path.join(self.logs_dir, "dmx-control.json")    # read by it
         self._picture_path = os.path.join(self.logs_dir, "picture.json")        # the picture settings, read by a visualizer that is open
@@ -316,6 +333,7 @@ class Launcher:
         self._summaries = {}         # path -> (mtime, size, summary)
         self._list_cache = None      # GDTF Share's list as last read from disk
         self.relay_options = []      # extra arguments for the sACN relay; the tests point it at their own ports
+        self.psn_to_port = psn.VISUALIZER_PORT    # where the visualizer hears the PosiStageNet the relay passes on
         self.code_files = [os.path.abspath(__file__), RELAY, gdtf_share.__file__, paperwork.__file__, paperwork.pdf.__file__, ndi_find.__file__, oslayer.__file__, mvr_xchange.__file__, mvr_xchange.mdns.__file__]
         self._code_stamp = self._code_changed_at()    # to notice being out of date: see state()
         self._run = None             # the Unreal process started last, and what it was started on
@@ -349,7 +367,7 @@ class Launcher:
         for key, value in changes.items():
             if key not in DEFAULTS:
                 raise Problem(f"There is no setting named {key}.")
-            if key in ("megalights", "shadows", "beam_shadows", "adapt_beams", "rig_haze", "idle_look", "invert_y"):
+            if key in ("megalights", "shadows", "beam_shadows", "adapt_beams", "rig_haze", "idle_look", "invert_y", "motion_blur", "surface_colour"):
                 if not isinstance(value, bool):
                     raise Problem(f"{key} must be on or off.")
             elif key == "protocol":
@@ -379,6 +397,14 @@ class Launcher:
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 0.5:
                     raise Problem("Haze must be between 0 and 0.5.")
                 value = float(value)
+            elif key in ("floor", "floor_shade"):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+                    raise Problem("Floor finish and colour must be between 0 and 1.")
+                value = float(value)
+            elif key == "bloom":
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 4:
+                    raise Problem("Glow must be between 0 and 4.")
+                value = float(value)
             elif key == "house_lights":
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
                     raise Problem("Work light must be between 0 and 1.")
@@ -401,12 +427,17 @@ class Launcher:
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.5 <= value <= 50:
                     raise Problem("Movement speed must be between 0.5 and 50 m/s.")
                 value = float(value)
-            elif key in ("xchange", "osc"):
+            elif key in ("xchange", "osc", "psn"):
                 if not isinstance(value, bool):
-                    raise Problem(f"{'MVR-xchange' if key == 'xchange' else 'OSC'} must be on or off.")
-            elif key == "osc_port":
+                    raise Problem(f"{ {'xchange': 'MVR-xchange', 'osc': 'OSC', 'psn': 'PosiStageNet'}[key]} must be on or off.")
+            elif key in ("osc_port", "psn_port"):
                 if isinstance(value, bool) or not isinstance(value, int) or not 1024 <= value <= 65535:
-                    raise Problem("The OSC port must be a number from 1024 to 65535.")
+                    raise Problem(f"The {'OSC' if key == 'osc_port' else 'PosiStageNet'} port must be a number from 1024 to 65535.")
+            elif key == "psn_group":
+                # A multicast group (224.0.0.0 to 239.255.255.255), or empty for what is sent to this computer's own address.
+                parts = value.split(".") if isinstance(value, str) else []
+                if value != "" and not (len(parts) == 4 and all(part.isdigit() and int(part) <= 255 for part in parts) and 224 <= int(parts[0]) <= 239):
+                    raise Problem("The PosiStageNet group must be a multicast address such as 236.10.10.10, or empty.")
             elif key == "xchange_group":
                 # It becomes one piece of a name on the network: no dots, nothing that is not plain.
                 if not isinstance(value, str) or len(value) > 60 or re.search(r"[^A-Za-z0-9 _-]", value) or value != value.strip():
@@ -440,7 +471,7 @@ class Launcher:
     # The settings a visualizer that is open takes up as they change (LvShow, -LvPicture): how the
     # picture looks and how the camera flies. The window and its resolution wait for the next start.
     PICTURE = ("exposure", "haze", "haze_drift", "house_lights", "beams", "beam_detail", "beam_shadows", "adapt_beams", "shadows", "megalights", "rig_haze",
-               "mouse_look", "look_speed", "move_speed", "invert_y")
+               "floor", "floor_shade", "bloom", "motion_blur", "mouse_look", "look_speed", "move_speed", "invert_y")
 
     def _write_picture(self, values):
         try:
@@ -459,7 +490,7 @@ class Launcher:
             os.replace(self._settings_path + ".part", self._settings_path)
             if any(key in self.PICTURE for key in changes):
                 self._write_picture(values)
-        if self.relay_enabled and ("protocol" in changes or "dmx_address" in changes):
+        if self.relay_enabled and any(key in changes for key in ("protocol", "dmx_address", "psn", "psn_group", "psn_port")):
             self.ensure_relay()    # listen where it now says
         return values
 
@@ -574,7 +605,7 @@ class Launcher:
             if name.lower().endswith(".mvr") and os.path.isfile(path):
                 summary = self._summary(path)
                 rows.append(dict(summary, name=name, size=os.path.getsize(path), modified=int(os.path.getmtime(path)),
-                                 edited=self._edited(path), hidden=self._hidden(path), placeholders=self._placeholders(summary),
+                                 edited=self._edited(path), hidden=self._hidden(path), groups=self._group_rows(path), placeholders=self._placeholders(summary),
                                  pieces=len(self._piece_list(path)), **self.history(name)))
         return rows
 
@@ -583,7 +614,7 @@ class Launcher:
     # What a show is beside its rig file: what was changed in Openviz and in the Unreal Editor.
     # A change made from this page keeps these as they were before it and after it, so that it can
     # be undone, and redone, in order. Kept in library/history/, so that Openviz can be quit between.
-    SIDE_FILES = (".edits.xml", ".types.xml", ".pieces.json", ".screens.json", ".hidden.json", ".paper.json")
+    SIDE_FILES = (".edits.xml", ".types.xml", ".pieces.json", ".screens.json", ".hidden.json", ".paper.json", ".groups.json")
     UNDO_DEPTH = 50
 
     def _side_files(self, mvr_path):
@@ -683,7 +714,8 @@ class Launcher:
         return mvr_path[:-4] + ".hidden.json"    # the layers and classes of a show that are not to be shown
 
     def _hidden(self, mvr_path):
-        """The layers and classes of a show chosen not to be shown: {"layers": [...], "classes": [...]}."""
+        """What of a show is chosen not to be shown: {"layers": [...], "classes": [...], "fixtures": [...]};
+        the fixtures are the ids of those in hidden groups, written there from the groups (_write_groups)."""
         try:
             with open(self._hidden_path(mvr_path), encoding="utf-8") as handle:
                 kept = json.load(handle)
@@ -692,7 +724,121 @@ class Launcher:
         if not isinstance(kept, dict):
             kept = {}
         return {key: [name for name in kept.get(key, []) if isinstance(name, str)] if isinstance(kept.get(key), list) else []
-                for key in ("layers", "classes")}
+                for key in ("layers", "classes", "fixtures")}
+
+    def _write_hidden(self, mvr_path, hidden):
+        target = self._hidden_path(mvr_path)
+        if not any(hidden.get(key) for key in ("layers", "classes", "fixtures")):
+            if os.path.exists(target):
+                os.replace(target, target + ".was")    # everything shown again: set the old choice aside
+            return
+        with open(target + ".part", "w", encoding="utf-8") as handle:
+            json.dump({key: hidden.get(key, []) for key in ("layers", "classes", "fixtures") if hidden.get(key) or key != "fixtures"}, handle, indent=1)
+        os.replace(target + ".part", target)
+
+    # Groups of fixtures of one's own: kept beside the show as "<show>.groups.json", {"groups": [{"id",
+    # "name", "uuids", "hidden"}]}. A group can be selected in the patch, and hidden: the fixtures of
+    # hidden groups are written into the hidden file (above), which the visualizer reads.
+    @staticmethod
+    def _groups_path(mvr_path):
+        return mvr_path[:-4] + ".groups.json"
+
+    def _group_list(self, mvr_path):
+        try:
+            with open(self._groups_path(mvr_path), encoding="utf-8") as handle:
+                listed = json.load(handle).get("groups", [])
+        except (OSError, ValueError, AttributeError):
+            return []
+        rows = []
+        for entry in listed if isinstance(listed, list) else []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not isinstance(entry.get("name"), str) or \
+                    not isinstance(entry.get("uuids"), list) or any(row["id"] == entry["id"] for row in rows):
+                continue
+            rows.append({"id": entry["id"], "name": entry["name"], "uuids": [uuid for uuid in entry["uuids"] if isinstance(uuid, str)],
+                         "hidden": entry.get("hidden") is True})
+        return rows
+
+    def _group_rows(self, mvr_path):
+        return [dict(row, count=len(row["uuids"])) for row in self._group_list(mvr_path)]
+
+    def _write_groups(self, mvr_path, rows):
+        target = self._groups_path(mvr_path)
+        if rows:
+            with open(target + ".part", "w", encoding="utf-8") as handle:
+                json.dump({"groups": rows}, handle, indent=1)
+            os.replace(target + ".part", target)
+        elif os.path.exists(target):
+            os.remove(target)
+        # What the visualizer hides: the fixtures of every hidden group.
+        hidden = self._hidden(mvr_path)
+        hidden["fixtures"] = sorted({uuid for row in rows if row["hidden"] for uuid in row["uuids"]})
+        self._write_hidden(mvr_path, hidden)
+
+    def _known_uuids(self, name, uuids):
+        if not isinstance(uuids, list) or not uuids or any(not isinstance(uuid, str) for uuid in uuids) or len(uuids) > 10000:
+            raise Problem("Select the fixtures for the group first.")
+        known = {row["uuid"].upper(): row["uuid"] for row in self.show_detail(name)["fixtures"] if row.get("uuid")}
+        missing = [uuid for uuid in uuids if uuid.upper() not in known]
+        if missing:
+            raise Problem(f"{len(missing)} fixture{'' if len(missing) == 1 else 's'} of that selection {'is' if len(missing) == 1 else 'are'} not in the show.")
+        return list(dict.fromkeys(known[uuid.upper()] for uuid in uuids))
+
+    @staticmethod
+    def _group_name(text, rows, but=None):
+        if not isinstance(text, str) or not text.strip() or len(text.strip()) > 60 or any(ord(ch) < 32 for ch in text):
+            raise Problem("A group needs a name of up to 60 characters.")
+        text = text.strip()
+        if any(row["name"].casefold() == text.casefold() and row["id"] != but for row in rows):
+            raise Problem(f"There is a group named {text} already.")
+        return text
+
+    def groups(self, name):
+        return {"name": name, "groups": self._group_rows(self._show_path(name))}
+
+    def add_group(self, name, group_name, uuids):
+        """Keeps the fixtures given as a group of the show, under a name."""
+        path = self._show_path(name)
+        chosen = self._known_uuids(name, uuids)
+        with self._lock:
+            rows = self._group_list(path)
+            taken = {row["id"] for row in rows}
+            number = next(n for n in range(1, len(rows) + 2) if f"group-{n}" not in taken)
+            rows.append({"id": f"group-{number}", "name": self._group_name(group_name, rows), "uuids": chosen, "hidden": False})
+            self._write_groups(path, rows)
+        return dict(self.groups(name), added=f"group-{number}")
+
+    def set_group(self, name, group_id, changes):
+        """Renames a group, hides or shows it, replaces its fixtures or adds to them."""
+        path = self._show_path(name)
+        if not isinstance(changes, dict) or not changes or any(key not in ("name", "hidden", "uuids", "add") for key in changes):
+            raise Problem("A group has a name, its fixtures and whether it is hidden.")
+        with self._lock:
+            rows = self._group_list(path)
+            row = next((row for row in rows if row["id"] == group_id), None)
+            if row is None:
+                raise Problem("That group is no longer in the show.")
+            if "name" in changes:
+                row["name"] = self._group_name(changes["name"], rows, but=group_id)
+            if "hidden" in changes:
+                if not isinstance(changes["hidden"], bool):
+                    raise Problem("Hidden must be on or off.")
+                row["hidden"] = changes["hidden"]
+            if "uuids" in changes:
+                row["uuids"] = self._known_uuids(name, changes["uuids"])
+            if "add" in changes:
+                row["uuids"] = list(dict.fromkeys(row["uuids"] + self._known_uuids(name, changes["add"])))
+            self._write_groups(path, rows)
+        return self.groups(name)
+
+    def remove_group(self, name, group_id):
+        """Takes a group away; its fixtures stay in the show, and are shown again if it was hidden."""
+        path = self._show_path(name)
+        with self._lock:
+            rows = self._group_list(path)
+            if not any(row["id"] == group_id for row in rows):
+                raise Problem("That group is no longer in the show.")
+            self._write_groups(path, [row for row in rows if row["id"] != group_id])
+        return self.groups(name)
 
     def set_hidden(self, name, layers, classes):
         """Chooses which layers and classes of a show are left out the next time it is opened."""
@@ -707,14 +853,8 @@ class Launcher:
             if unknown:
                 raise Problem(f"{name} has no {'layer' if key == 'layers' else 'class'} named {unknown[0]}.")
             wanted[key] = sorted(set(names), key=str.casefold)
-        target = self._hidden_path(path)
-        if not wanted["layers"] and not wanted["classes"]:
-            if os.path.exists(target):
-                os.replace(target, target + ".was")    # everything shown again: set the old choice aside
-        else:
-            with open(target + ".part", "w", encoding="utf-8") as handle:
-                json.dump(wanted, handle, indent=1)
-            os.replace(target + ".part", target)
+        wanted["fixtures"] = self._hidden(path)["fixtures"]    # those of hidden groups stay hidden
+        self._write_hidden(path, wanted)
         return {"hidden": self._hidden(path)}
 
     # ------------------------------------------------------------------- exchange with the console
@@ -815,6 +955,11 @@ class Launcher:
         "person": {"label": "Person", "size": (500.0, 300.0, 1750.0), "grey": 0.25, "at": (0.0, 0.0, 0.0)},
         "circle": {"label": "Truss circle", "size": (8000.0, 290.0, 290.0), "grey": 0.45, "at": (0.0, 0.0, 6000.0)},
         "corner": {"label": "Truss corner", "size": (2000.0, 290.0, 290.0), "grey": 0.45, "at": (0.0, 0.0, 6000.0)},
+        "triangle": {"label": "Triangle truss", "size": (8000.0, 290.0, 290.0), "grey": 0.45, "at": (0.0, 0.0, 6000.0)},
+        "pipe": {"label": "Pipe", "size": (10000.0, 48.0, 48.0), "grey": 0.04, "at": (0.0, 0.0, 6000.0)},
+        "boom": {"label": "Boom", "size": (450.0, 48.0, 3000.0), "grey": 0.04, "at": (0.0, 0.0, 0.0)},
+        "crowd": {"label": "Crowd", "size": (12000.0, 8000.0, 1750.0), "grey": 0.12, "at": (0.0, -9000.0, 0.0)},
+        "stairs": {"label": "Stairs", "size": (1200.0, 1200.0, 600.0), "grey": 0.03, "at": (0.0, -2000.0, 0.0)},
         "model": {"label": "Model", "size": (1000.0, 1000.0, 1000.0), "grey": 0.5, "at": (0.0, 0.0, 0.0)},
     }
     MODEL_UNITS = ("", "mm", "cm", "m", "in", "ft")
@@ -828,7 +973,7 @@ class Launcher:
         """A set piece as it should be, or a Problem saying what is wrong with it. What is missing is as its kind usually is."""
         kind = entry.get("kind")
         if kind not in cls.PIECES:
-            raise Problem("A set piece must be a deck, drape, truss, truss circle, truss corner, box, person or model.")
+            raise Problem("A set piece must be a deck, stairs, drape, truss, truss circle, truss corner, triangle truss, pipe, boom, box, person, crowd or model.")
         usual = cls.PIECES[kind]
 
         def number(key, otherwise, low, high, wrong):
@@ -849,6 +994,15 @@ class Launcher:
         for key, otherwise in zip(("x", "y", "z"), usual["at"]):
             out[key] = number(key, otherwise, -500000, 500000, "A set piece stands within 500 metres of the middle of the stage.")
         out["turn"] = number("turn", 0.0, -360, 360, "A set piece is turned by between -360 and 360 degrees.")
+        tracker = entry.get("tracker")
+        if tracker not in (None, 0, ""):
+            # Where a tracking system's tracker of that number is (PosiStageNet), the piece goes, while a show is watched.
+            if isinstance(tracker, bool) or not isinstance(tracker, int) or not 1 <= tracker <= 65535:
+                raise Problem("A tracker is a number from 1 to 65535.")
+            follow_height = entry.get("follow_height", False)
+            if not isinstance(follow_height, bool):
+                raise Problem("Following the tracker's height is on or off.")
+            out.update(tracker=tracker, follow_height=follow_height)
         picture = entry.get("picture", "")
         if picture:
             # A picture on its side toward the house: a printed backdrop, a sign.
@@ -999,8 +1153,8 @@ class Launcher:
     def set_piece(self, name, piece_id, changes):
         """Changes a set piece of a show: its name, its measures, where it stands, how it is turned, its colour."""
         path = self._show_path(name)
-        if not isinstance(changes, dict) or not changes or any(key not in ("name", "width", "depth", "height", "x", "y", "z", "turn", "colour", "file", "units", "up", "picture") for key in changes):
-            raise Problem("Set pieces have a name, size, position, rotation and colour; models also have a file, units and an up axis.")
+        if not isinstance(changes, dict) or not changes or any(key not in ("name", "width", "depth", "height", "x", "y", "z", "turn", "colour", "file", "units", "up", "picture", "tracker", "follow_height") for key in changes):
+            raise Problem("Set pieces have a name, size, position, rotation, colour and a tracker to follow; models also have a file, units and an up axis.")
         with self._lock:
             rows = self._piece_list(path)
             row = next((row for row in rows if row["id"] == piece_id), None)
@@ -1013,6 +1167,9 @@ class Launcher:
                 raise Problem("That picture file could not be found.")
             if "picture" in changes and not changes["picture"]:
                 row.pop("picture", None)
+            if "tracker" in changes and not changes["tracker"]:
+                row.pop("tracker", None)
+                row.pop("follow_height", None)
             if not row["name"]:
                 raise Problem("A set piece needs a name.")
             self._write_pieces(path, rows)
@@ -1065,6 +1222,8 @@ class Launcher:
                     # Which way the type's pan and tilt are read in this show, and whether it has such channels at all.
                     types[parts[1]].update(invert_pan=parts[2] == "1", invert_tilt=parts[3] == "1", pan_offset=float(parts[4]), tilt_offset=float(parts[5]),
                                            has_pan=parts[6] == "1", has_tilt=parts[7] == "1")
+                elif parts[0] == "curve" and len(parts) == 3 and parts[1] in types:
+                    types[parts[1]]["dimmer_curve"] = parts[2]    # how its dimmer level becomes light in this show
                 elif parts[0] == "error" and len(parts) == 2:
                     raise Problem(f"The show's fixture types could not be read: {parts[1]}")
             except ValueError:
@@ -1161,6 +1320,20 @@ class Launcher:
                                    "How the type's pan and tilt are read could not be saved")
         return self.show_types(name)
 
+    DIMMER_CURVES = ("linear", "square", "inverse-square", "s-curve")
+
+    def set_type_curve(self, name, spec, curve):
+        """Says how a fixture type's dimmer level becomes light in a show: as the file has it
+        (linear), or bent as a dimmer rack or a console's profile would (square law, inverse square,
+        an S-curve). For every fixture of the type; taken up at once by a show that is open."""
+        path = self._show_path(name)
+        self._type_of(path, spec)
+        if curve not in self.DIMMER_CURVES:
+            raise Problem("A dimmer curve is linear, square, inverse-square or s-curve.")
+        with self._lock:
+            self._inspector_writes(["--dimmer-curve", path, spec, curve], "The dimmer curve could not be saved")
+        return self.show_types(name)
+
     def clear_stand_in(self, name, spec):
         """Takes a type's stand-in away again: its fixtures are read from the rig file's own type once more."""
         path = self._show_path(name)
@@ -1180,6 +1353,77 @@ class Launcher:
         facts = dict(line.split("\t", 1) for line in done.stdout.splitlines() if "\t" in line)
         if done.returncode != 0 or "error" in facts:
             raise Problem(f"{failed}: {facts.get('error', 'the core gave no reason')}")
+
+    def builder(self, name="", spec="", file=""):
+        """What the Fixture Builder starts from: a fixture type it made before (`file`, in the fixture
+        library), a show's placeholder type (`name`, `spec`: the modes in use, their channel counts and
+        the dimmer), or a beam moving head. With the kinds of channel it offers."""
+        start = None
+        if file:
+            path = self._library_file(file)
+            with open(path, "rb") as stream:
+                start = fixture_builder.read_spec(stream.read())
+            if start is None:
+                raise Problem(f"{bare_type(file)} was not made with the Fixture Builder, so it cannot be edited there.")
+        elif name:
+            path = self._show_path(name)
+            entry = self._type_of(path, spec)
+            start = fixture_builder.placeholder_spec(self._packed_type(path, spec), entry["name"],
+                                                     [{"name": mode["name"], "slots": mode["slots"]} for mode in entry["modes"] if mode["fixtures"]])
+        return {"catalogue": fixture_builder.catalogue(), "spec": start or fixture_builder.default_spec("moving"), "file": file if start else ""}
+
+    @staticmethod
+    def builder_template(key, spec=None, keep_modes=False):
+        """A Fixture Builder description with a template's typical figures laid over it."""
+        if spec is not None and not isinstance(spec, dict):
+            raise Problem("The description must be a set of names and values.")
+        try:
+            return {"spec": fixture_builder.from_template(key, spec, keep_modes is True)}
+        except fixture_builder.BuildError as error:
+            raise Problem(str(error)) from None
+
+    def _library_file(self, file):
+        if not isinstance(file, str) or os.path.basename(file) != file or not file.lower().endswith(".gdtf"):
+            raise Problem("Specify a file from the fixture library.")
+        path = os.path.join(self.fixtures_dir, file)
+        if not os.path.isfile(path):
+            raise Problem(f"{file} is not in the fixture library.")
+        return path
+
+    @staticmethod
+    def _packed_type(path, spec):
+        """The GDTF file of a fixture type as the show's MVR packs it, or b"" where it does not."""
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = {entry.casefold(): entry for entry in archive.namelist()}
+                found = names.get(spec.casefold()) or names.get(f"{bare_type(spec)}.gdtf".casefold())
+                return archive.read(found) if found else b""
+        except (zipfile.BadZipFile, OSError, KeyError):
+            return b""
+
+    def build_fixture(self, description, name="", spec=""):
+        """Writes the fixture type a Fixture Builder description makes into the fixture library, and,
+        given a show and one of its types, has it replace that type. A file of that name made by the
+        builder from the same description is written over; any other is left alone."""
+        try:
+            checked = fixture_builder.check(description)
+        except fixture_builder.BuildError as error:
+            raise Problem(str(error)) from None
+        file = fixture_builder.file_name(checked)
+        target = os.path.join(self.fixtures_dir, file)
+        with self._lock:
+            if os.path.exists(target):
+                with open(target, "rb") as stream:
+                    theirs = fixture_builder.read_spec(stream.read())
+                if not theirs or theirs.get("id") != checked["id"]:
+                    raise Problem(f"Your fixture library already has a fixture type called {checked['manufacturer']} {checked['name']}. Give this one another name.")
+            with open(target + ".part", "wb") as stream:
+                stream.write(fixture_builder.build_gdtf(checked))
+            os.replace(target + ".part", target)
+        answer = {"file": file, "spec": checked}
+        if name:
+            answer["types"] = self.set_stand_in(name, spec, file)
+        return answer
 
     def share_stand_in(self, name, spec, rid):
         """Fetches a fixture from GDTF Share into the library and has it stand in for a type of a show."""
@@ -1239,19 +1483,45 @@ class Launcher:
             raise Problem("A crop is given as left, top, right and bottom edges, each from 0 to 1.")
         return [round(float(edge), 6) for edge in part]
 
+    @staticmethod
+    def _checked_map(numbers):
+        """A part of a picture that need not be upright in it (an LED processor's map may lay panels
+        out turned): where the screen's top left corner is in the picture, and how far the picture
+        moves across its width and down its height, as shares of the whole: [ox, oy, ux, uy, vx, vy].
+        None for none."""
+        if numbers is None:
+            return None
+        if (not isinstance(numbers, list) or len(numbers) != 6
+                or any(isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) or abs(n) > 10 for n in numbers)
+                or abs(numbers[2] * numbers[5] - numbers[3] * numbers[4]) < 1e-9):
+            raise Problem("A map is the picture's corner and its steps across and down: six numbers.")
+        return [round(float(n), 7) for n in numbers]
+
     @classmethod
     def _checked_more(cls, entry, added, files_must_exist=False):
         """What a screen has beyond its picture and its place: the part of the picture it shows, the
         sections it is split into, and, for a screen that lies where fixtures hang, its face and
         the fixtures it stands in for. Raises Problem at the first thing that is not right."""
-        more = {"part": cls._checked_part(entry.get("part", [0, 0, 1, 1])), "columns": 0, "rows": 0, "sections": [], "replaces": [], "face": None}
+        more = {"part": cls._checked_part(entry.get("part", [0, 0, 1, 1])), "columns": 0, "rows": 0, "sections": [], "replaces": [], "face": None,
+                "map": cls._checked_map(entry.get("map"))}
         replaces, face = entry.get("replaces"), entry.get("face")
-        if replaces is not None or face is not None:
+        if replaces is not None:
             if (not added or not isinstance(replaces, list) or not 1 <= len(replaces) <= 4096 or any(not isinstance(one, str) or not 0 < len(one) <= 64 for one in replaces)
-                    or not isinstance(face, list) or len(face) != 12
-                    or any(isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number) for number in face)):
+                    or face is None):
                 raise Problem("That screen does not replace any fixtures.")
             more["replaces"] = list(replaces)
+        if face is not None:
+            # Where it lies, not necessarily upright: its picture's right, up and out, and its middle in
+            # millimetres. A screen over fixtures has one; a screen added here may have one too (2026-10-20:
+            # LED panels round a raked truss), in place of standing upright at x, y, z, turned.
+            if (not added or not isinstance(face, list) or len(face) != 12
+                    or any(isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number) for number in face)):
+                raise Problem("A screen's face is its right, up and out directions and its middle: twelve numbers.")
+            right, up, out = face[0:3], face[3:6], face[6:9]
+            unit = lambda v: abs(math.sqrt(sum(c * c for c in v)) - 1.0) < 0.01
+            square = lambda a, b: abs(sum(x * y for x, y in zip(a, b))) < 0.01
+            if not (unit(right) and unit(up) and unit(out) and square(right, up) and square(right, out) and square(up, out)):
+                raise Problem("A screen's right, up and out must be at right angles to each other, each of length 1.")
             more["face"] = [float(number) for number in face]
         columns, rows, sections = entry.get("columns", 0), entry.get("rows", 0), entry.get("sections", [])
         if columns or rows or sections:
@@ -1278,7 +1548,11 @@ class Launcher:
             if row.get("columns"):
                 entry.update(columns=row["columns"], rows=row["rows"], sections=row["sections"])
             if row.get("replaces"):
-                entry.update(replaces=row["replaces"], face=row["face"])
+                entry["replaces"] = row["replaces"]
+            if row.get("face"):
+                entry["face"] = row["face"]
+            if row.get("map"):
+                entry["map"] = row["map"]
             kept.append(entry)
         target = self._screens_path(mvr_path)
         with open(target + ".part", "w", encoding="utf-8") as handle:
@@ -1382,7 +1656,7 @@ class Launcher:
         taken = set()
         for row in rows:
             row["class"] = row.get("class", "")
-            for key, empty in (("part", [0, 0, 1, 1]), ("columns", 0), ("rows", 0), ("sections", []), ("replaces", []), ("face", None)):
+            for key, empty in (("part", [0, 0, 1, 1]), ("columns", 0), ("rows", 0), ("sections", []), ("replaces", []), ("face", None), ("map", None)):
                 row.setdefault(key, empty)
             judged(row)
             row["sections"] = [dict(section) for section in row["sections"]]
@@ -1439,20 +1713,23 @@ class Launcher:
             raise Problem("Specify a screen and the changes to make.")
         with self._lock:
             now = self._one_screen(name, ident)
-            content = {"source", "value", "nits", "part"}
+            content = {"source", "value", "nits", "part", "map"}
             # A screen in the place of fixtures is as large as they are and lies where they hang.
             allowed = content | ({"name"} if now["replaces"] else set(SCREEN_DEFAULTS) if now["added"] else set())
             if set(changes) - allowed:
                 raise Problem("Screens from the MVR can only be moved in the program that made the MVR." if not now["added"] and set(changes) <= set(SCREEN_DEFAULTS)
                               else "This screen is as large as the fixtures it stands in for, and lies where they hang." if now["replaces"] and set(changes) <= set(SCREEN_DEFAULTS)
                               else "Unknown screen property.")
-            wanted = dict({key: now[key] for key in (set(SCREEN_DEFAULTS) if now["added"] else {"source", "value", "nits"})}, **{key: value for key, value in changes.items() if key != "part"})
+            wanted = dict({key: now[key] for key in (set(SCREEN_DEFAULTS) if now["added"] else {"source", "value", "nits"})}, **{key: value for key, value in changes.items() if key not in ("part", "map")})
             if "source" in changes and "value" not in changes and changes["source"] != now["source"]:
                 wanted["value"] = ""    # a film's file is no picture, and neither is a stream's name
             checked = self._checked_screen(wanted, added=now["added"], wall=bool(now["replaces"]))
             changed = dict(now, **checked)
             if "part" in changes:
                 changed["part"] = self._checked_part(changes["part"])
+                changed["map"] = None    # an upright part in its place
+            if "map" in changes:
+                changed["map"] = self._checked_map(changes["map"])
             self._put_screen(path, changed)
         return self.screens(name)
 
@@ -1464,6 +1741,7 @@ class Launcher:
             raise Problem("This show has no such screen.")
         kept = next((row for row in self._screen_settings(path) if row["id"] == ident and row["added"] == now["added"]), None)
         now["face"] = kept["face"] if kept else None
+        now["map"] = kept["map"] if kept else None
         now["sections"] = [{key: section[key] for key in ("source", "value", "nits", "part")} for section in now["sections"]]
         return now
 
@@ -1552,7 +1830,10 @@ class Launcher:
         path = self._show_path(name)
         if fields is not None and not isinstance(fields, dict):
             raise Problem("Screens have a name, size and position.")
-        if set(fields or {}) - set(SCREEN_DEFAULTS):
+        fields = dict(fields or {})
+        face = fields.pop("face", None)    # lying as it is given, rather than upright
+        where = {key: fields.pop(key) for key in ("map", "part") if key in fields}    # which part of its picture
+        if set(fields) - set(SCREEN_DEFAULTS):
             raise Problem("Unknown screen property.")
         with self._lock:
             rows = self._screen_settings(path)
@@ -1561,12 +1842,33 @@ class Launcher:
             if "name" not in (fields or {}):
                 wanted["name"] = next(f"Screen {number}" for number in range(1, 10000) if f"Screen {number}" not in taken)
             checked = self._checked_screen(wanted, added=True)
+            more = self._checked_more(dict(where, **({"face": face} if face is not None else {})), added=True)
             if sum(1 for row in rows if row["added"]) >= 64:
                 raise Problem("A show can have up to 64 added screens.")
             ident = "added-" + secrets.token_hex(8)
-            rows.append(dict(checked, id=ident, added=True))
+            rows.append(dict(checked, id=ident, added=True, **more))
             self._write_screens(path, rows)
         return dict(self.screens(name), added=ident)
+
+    def rename_stream(self, name, old, new):
+        """Points every screen and section of a show that shows the NDI stream `old` at `new`
+        instead: for a stream that turns out to be called otherwise on the network."""
+        path = self._show_path(name)
+        for value in (old, new):
+            if not isinstance(value, str) or not value.strip() or len(value) > 1000 or any(ord(ch) < 32 for ch in value):
+                raise Problem("That is not a valid stream name.")
+        with self._lock:
+            rows = self._screen_settings(path)
+            changed = 0
+            for row in rows:
+                for target in [row] + row.get("sections", []):
+                    if target["source"] == "ndi" and target["value"] == old:
+                        target["value"] = new.strip()
+                        changed += 1
+            if not changed:
+                raise Problem(f"No screen shows {old}.")
+            self._write_screens(path, rows)
+        return dict(self.screens(name), renamed=changed)
 
     def remove_screen(self, name, ident):
         """Takes a screen that was added here out of a show again."""
@@ -1580,13 +1882,18 @@ class Launcher:
         return self.screens(name)
 
     def ndi_sources(self):
-        """The NDI streams on this computer's networks right now, by name."""
-        return {"sources": ndi_find.find(1.2, local_addresses())}
+        """The NDI streams on this computer's networks right now, by name: as NDI's own library
+        finds them where Unreal brings one (as the visualizer's receiver will), and as multicast
+        DNS finds them."""
+        library = ndi_find.library_path(self.settings().get("engine"))
+        found = set(ndi_find.find_with_library(library, 3.0) or []) if library else set()
+        found.update(ndi_find.find(1.5, local_addresses()))
+        return {"sources": sorted(found, key=str.casefold)}
 
     def choose_file(self, kind):
         """Has the user pick a picture or a film in the system's own file window. Returns its path, or none if they thought better of it."""
-        if kind not in ("picture", "film"):
-            raise Problem("Choose a picture or a video file.")
+        if kind not in ("picture", "film", "sound"):
+            raise Problem("Choose a picture, a video file or a sound file.")
         command = oslayer.choose_file_command(kind)
         if command is None:
             raise Problem("Type or paste the file's full path into the field.", code="no_chooser")
@@ -1794,12 +2101,17 @@ class Launcher:
             raise Problem(f"The patch could not be read: {error}") from None
         fixtures = []
         by_uuid = {}
+        focus_points = []    # the rig file's own, which fixtures can be aimed at
         for line in done.stdout.splitlines():
             parts = line.split("\t")
             if parts[0] == "error" and len(parts) == 2:
                 raise Problem(f"{name} cannot be read: {parts[1]}")
             try:
-                if parts[0] == "fixture" and len(parts) == 14:
+                if parts[0] == "focuspoint" and len(parts) == 6:
+                    focus_points.append({"uuid": parts[1], "name": parts[2] or "Focus point", "place": [round(float(part), 3) for part in parts[3:6]]})
+                elif parts[0] == "focus" and len(parts) == 3 and parts[1] in by_uuid:
+                    by_uuid[parts[1]]["focus"] = parts[2]    # the focus point the rig file aims it at
+                elif parts[0] == "fixture" and len(parts) == 14:
                     row = {"uuid": parts[1], "id": parts[2], "name": parts[3], "layer": parts[4], "type": parts[5],
                            "mode": parts[6], "universe": int(parts[7]), "address": int(parts[8]), "slots": int(parts[9]),
                            "notes": [note for note in parts[10].split(",") if note], "problems": [],
@@ -1816,7 +2128,8 @@ class Launcher:
                     by_uuid[parts[1]]["modes"] = [{"name": parts[k], "slots": int(parts[k + 1])} for k in range(2, len(parts) - 1, 2)]
             except ValueError:
                 continue
-        return dict(check_patch(fixtures), name=name, edited=self._edited(path), totals=rig_totals(fixtures),
+        return dict(check_patch(fixtures), name=name, edited=self._edited(path), totals=rig_totals(fixtures), focus_points=focus_points,
+                    groups=self._group_rows(path),
                     open=bool(self._run and self._run["process"].poll() is None and self._run["name"] == name))
 
     def _change_show(self, name, arguments, what):
@@ -1857,12 +2170,13 @@ class Launcher:
     # What can be set on fixtures of a show, as the core's --set takes it, and what each is.
     _SETTABLE = {"x": "number", "y": "number", "z": "number", "dx": "number", "dy": "number", "dz": "number",
                  "stepx": "number", "stepy": "number", "stepz": "number", "rx": "angle", "ry": "angle", "rz": "angle", "spin": "angle",
+                 "aimx": "number", "aimy": "number", "aimz": "number",
                  "universe": "universe", "address": "address", "mode": "text", "name": "text", "number": "whole", "id": "id",
                  "invertpan": "flag", "inverttilt": "flag", "type": "type", "reset": "reset"}
 
     def set_fixtures(self, name, uuids, changes):
         """Changes fixtures of a show: where they stand and how they are turned (millimetres and
-        degrees, the rig file's coordinates), their patch, mode, name, number, whether their own
+        degrees, the rig file's coordinates) or the point they are aimed at (`aimx/y/z`), their patch, mode, name, number, whether their own
         pan and tilt are mirrored, and their fixture type (`type`, a file of the fixture library). Several fixtures are taken in the order given: a patch runs on
         from one to the next, `stepx/y/z` sets them out in a row, `number` and `id` count up.
         Everything goes into the show's edits through the core; the rig file is not touched, and a
@@ -1916,8 +2230,15 @@ class Launcher:
             arguments.append(f"{key}={written}")
         if ("universe" in changes) != ("address" in changes) and changes.get("universe") != 0:
             raise Problem("A patch needs both a universe and an address.")
+        if any(key in changes for key in ("aimx", "aimy", "aimz")) and not all(key in changes for key in ("aimx", "aimy", "aimz")):
+            raise Problem("Aiming needs a point: X, Y and Z.")
         lines = self._change_show(name, ["--set", self.fixtures_dir, ",".join(uuids), *arguments], "fixtures cannot be changed")
-        return {"set": [text for kind, text in lines if kind == "set"]}
+        answer = {"set": [text for kind, text in lines if kind == "set"]}
+        if "aimx" in changes:
+            # Which were turned toward the point, and why the others were not: those that pan or tilt are aimed by the console.
+            answer["aimed"] = [text for kind, text in lines if kind == "aimed"]
+            answer["not_aimed"] = [{"uuid": text.split("\t")[0], "why": text.split("\t")[-1]} for kind, text in lines if kind == "notaimed"]
+        return answer
 
     def remove_fixture(self, name, uuid, restore=False):
         """Takes a fixture out of a show, or puts one of the rig file's back in. The MVR is not touched."""
@@ -2174,10 +2495,21 @@ class Launcher:
             raise Problem("That file is not among the exports found on this computer.")
         return self.add_file(os.path.basename(path), path)
 
+    @staticmethod
+    def _newer_revision(entry, by_name):
+        """The newest revision of the same fixture by the same kind of uploader (the manufacturer, or
+        the community) uploaded after this one, or None. `by_name`: the list's revisions by
+        (manufacturer, fixture), casefolded."""
+        same = by_name.get((entry["manufacturer"].casefold(), entry["fixture"].casefold()), [])
+        later = [other for other in same if gdtf_share.by_manufacturer(other) == gdtf_share.by_manufacturer(entry) and other["creationDate"] > entry["creationDate"]]
+        return max(later, key=lambda other: (other["creationDate"], other["rid"])) if later else None
+
     def fixtures(self):
         listed = {}
-        for entry in self._list()[0] or []:
+        entries, _, grouped = self._list()
+        for entry in entries or []:
             listed[gdtf_share.file_name(entry)] = entry
+        by_name = {(revisions[0]["manufacturer"].casefold(), revisions[0]["fixture"].casefold()): revisions for revisions in grouped if revisions}
         rows = []
         for name in sorted(os.listdir(self.fixtures_dir), key=str.casefold):
             path = os.path.join(self.fixtures_dir, name)
@@ -2193,6 +2525,14 @@ class Launcher:
                 if theirs and not row.get("error") and not row.get("unchecked"):
                     row["footprints_differ"] = sorted(name for name, slots in theirs.items() if ours.get(name) != slots)
                     row["footprints_checked"] = len(theirs)
+                newer = self._newer_revision(entry, by_name)
+                if newer:    # GDTF Share has had a newer upload of it since
+                    row["update"] = {"rid": newer["rid"], "revision": newer["revision"], "file": gdtf_share.file_name(newer)}
+            try:    # made with the Fixture Builder, so it can be edited there
+                with zipfile.ZipFile(path) as archive:
+                    row["built"] = fixture_builder.DESCRIPTION_FILE in archive.namelist()
+            except (zipfile.BadZipFile, OSError):
+                row["built"] = False
             rows.append(row)
         return rows
 
@@ -2265,7 +2605,7 @@ class Launcher:
             kept = f"{path[:-4]}.replaced-{time.strftime('%Y%m%d-%H%M%S')}.mvr.was"
             os.replace(path, kept)
             os.replace(newer_path, path)
-            for extra in (".edits.xml", ".views.txt", ".hidden.json", ".screens.json", ".types.xml", ".pieces.json", ".paper.json"):    # anything done to the newer copy on its own
+            for extra in (".edits.xml", ".views.txt", ".hidden.json", ".screens.json", ".types.xml", ".pieces.json", ".paper.json", ".groups.json"):    # anything done to the newer copy on its own
                 stray = newer_path[:-4] + extra
                 if os.path.exists(stray):
                     os.replace(stray, stray + ".was")
@@ -2427,6 +2767,53 @@ class Launcher:
             self._share_call(lambda share: share.download(rid, path))
         return next((row for row in self.fixtures() if row["file"] == os.path.basename(path)), {"file": os.path.basename(path)})
 
+    def fixture_thumbnail(self, file):
+        """The picture a fixture type's file carries of the fixture (GDTF's thumbnail: PNG, else SVG)."""
+        path = self._library_file(file)
+        try:
+            with zipfile.ZipFile(path) as archive:
+                root = ET.fromstring(archive.read("description.xml"))
+                fixture = root.find("FixtureType")
+                stem = (fixture.get("Thumbnail") if fixture is not None else "") or "thumbnail"
+                names = {name.casefold(): name for name in archive.namelist()}
+                for ending, kind in ((".png", "image/png"), (".svg", "image/svg+xml")):
+                    found = names.get((stem + ending).casefold())
+                    if found:
+                        data = archive.read(found)
+                        if len(data) <= 4 << 20:
+                            picture = PictureBytes(data)
+                            picture.content_type = kind
+                            return picture
+        except (zipfile.BadZipFile, KeyError, OSError, ET.ParseError):
+            pass
+        raise Problem("This fixture type has no picture.", code="no_picture", status=404)
+
+    def update_fixture(self, file):
+        """Fetches the newer revision GDTF Share has of a fixture type of the library, and has it
+        replace the older one wherever a show uses that in a placeholder's place. The older file is
+        kept, and a show whose modes the newer one does not fit keeps it."""
+        self._library_file(file)
+        row = next((row for row in self.fixtures() if row["file"] == file), None)
+        if not row or not row.get("update"):
+            raise Problem(f"GDTF Share's fixture list has no newer revision of {bare_type(file)}. Refresh the list after signing in to look again.")
+        new = self.share_download(row["update"]["rid"])["file"]
+        replaced, kept = [], []
+        for show in self.show_names():
+            try:
+                types = self._types(self._show_path(show))
+            except Problem:
+                continue
+            for entry in types:
+                if entry["standin"] != file:
+                    continue
+                try:
+                    with self.changing(show, "Update Fixture Type"):
+                        self.set_stand_in(show, entry["spec"], new)
+                    replaced.append({"show": show, "type": entry["name"]})
+                except Problem as error:
+                    kept.append({"show": show, "type": entry["name"], "why": str(error)})
+        return {"file": new, "replaced": replaced, "kept": kept}
+
     # ---------------------------------------------------------------------------------- Unreal
 
     def command(self, kind, name, mode="", editor=False, extra=(), render=None):
@@ -2461,8 +2848,13 @@ class Launcher:
             command += ["-LvProtocol=artnet", "-LvDmxAddress=127.0.0.1", f"-LvDmxVia={via}@{settings['dmx_address']}"]
         else:
             command += ["-LvProtocol=artnet", f"-LvDmxAddress={settings['dmx_address']}"]
+        if settings["psn"] and self.relay_enabled and self.relay_possible(settings):
+            command.append(f"-LvPsnPort={self.psn_to_port}")    # what Openviz's receiver passes on of the trackers
         command += [f"-LvExposure={settings['exposure']:g}", f"-LvHaze={settings['haze']:g}",
                     f"-LvAmbient={settings['house_lights']:g}", f"-LvBeams={settings['beams']}", f"-LvBeamRes={settings['beam_detail']}", f"-LvBeamShadows={int(settings['beam_shadows'])}", f"-LvAdaptBeams={int(settings['adapt_beams'])}", f"-LvHazeDrift={settings['haze_drift']:g}", f"-LvHazers={int(settings['rig_haze'])}",
+                    f"-LvFloor={settings['floor']:g}", f"-LvFloorShade={settings['floor_shade']:g}", f"-LvBloom={settings['bloom']:g}", f"-LvMotionBlur={int(settings['motion_blur'])}",
+                    # The engine keeps what a gobo lets through as brightness only unless told at start to keep colour.
+                    *(["-ini:Engine:[/Script/Engine.RendererSettings]:r.LightFunctionAtlas.Format=1"] if settings["surface_colour"] else []),
                     f"-LvMouseLook={settings['mouse_look']}", f"-LvLookSpeed={settings['look_speed']:g}",
                     f"-LvMoveSpeed={settings['move_speed'] * 100:g}", f"-LvInvertY={int(settings['invert_y'])}",
                     f"-LvShadows={int(settings['shadows'])}", f"-LvMegaLights={int(settings['megalights'])}",
@@ -2535,7 +2927,7 @@ class Launcher:
         if settings["protocol"] == "sacn":
             rows = self.shows()
             universes = min(2000, max([64] + [row.get("universes", 0) + 1 for row in rows] + [self._pixel_universes(row["name"]) + 1 for row in rows]))
-        return settings["protocol"], settings["dmx_address"], universes
+        return settings["protocol"], settings["dmx_address"], universes, (settings["psn_group"], settings["psn_port"]) if settings["psn"] else None
 
     def _pixel_universes(self, name):
         """The highest universe a show's screens take pixels from; 0 if none does."""
@@ -2569,9 +2961,11 @@ class Launcher:
                     os.remove(stale)
             self._control = {}
             self._relay_take = None
-            protocol, address, universes = wanted
+            protocol, address, universes, tracking = wanted
             command = [sys.executable, RELAY, "--protocol", protocol, "--interface", address, "--universes", str(max(universes, 1)),
                        "--parent-pid", str(os.getpid()), "--monitor", self._monitor_path, "--control", self._control_path, *self.relay_options]
+            if tracking:
+                command += ["--psn", f"{tracking[0]}:{tracking[1]}", "--psn-to", str(self.psn_to_port)]
             run = self._run
             if run and run["process"].poll() is None:
                 command += ["--while-pid", str(run["process"].pid)]
@@ -2696,8 +3090,13 @@ class Launcher:
         # A live recording runs from "video: recording" to "video: saved" or "not saved"; a render says how far it has got.
         filming = None
         progress = None
+        metering = False    # light levels shown over the stage: from "light levels on" to "light levels off"
         for line in lines:
             text = line["text"]
+            if text.startswith("light levels on"):
+                metering = True
+            elif text.startswith("light levels off"):
+                metering = False
             if text.startswith("video: recording to "):
                 filming = time.time()
             elif text.startswith("video: saved ") or text.startswith("video: not "):
@@ -2706,13 +3105,16 @@ class Launcher:
             if found:
                 progress = [int(found.group(1)), int(found.group(2))]
         self._follow_videos(run)
+        self._follow_panoramas(run)
         render = run.get("render")
         crash = self._crash(run) if code not in (None, 0) and not run.get("stopped") else None
         return {"crash": crash, "running": code is None, "exit_code": code, "kind": run["kind"], "name": run["name"],
                 "editor": run["editor"], "started": int(run["started"]), "lines": lines[-60:],
                 "stopped": bool(run.get("stopped")), "views": self.stored_views(run["name"]) if run["kind"] == "show" else [],
-                "filming": filming is not None and code is None, "rendering": os.path.basename(render["recording"]) if render else "",
-                "progress": progress, "videos": [dict(entry, made=path) for path, entry in self._videos.items() if entry.get("run") == run["started"]]}
+                "filming": filming is not None and code is None, "metering": metering and code is None,
+                "rendering": os.path.basename(render["recording"]) if render else "",
+                "progress": progress, "videos": [dict(entry, made=path) for path, entry in self._videos.items() if entry.get("run") == run["started"]],
+                "panoramas": [dict(entry) for entry in self._panoramas.values() if entry.get("run") == run["started"]]}
 
     # ------------------------------------------------------------------------- building Unreal
 
@@ -2891,11 +3293,15 @@ class Launcher:
             keys.insert(0, (start_view, 0.0))
         return keys
 
-    def render(self, name, recording, rate=30, view=0, path=""):
+    SOUND_ENDINGS = (".wav", ".mp3", ".m4a", ".aac", ".aif", ".aiff", ".flac", ".caf")
+
+    def render(self, name, recording, rate=30, view=0, path="", sound="", sound_start=0.0):
         """Renders a DMX recording to video on a show: the visualizer opens it, plays the recording
         frame by frame at a steady clock, however long each frame takes to draw, writes every frame
         into a movie, and closes at the end. The movie is the window's size (Picture, Resolution).
-        The camera stays at `view`, or follows `path` (camera_path) from one stored view to the next."""
+        The camera stays at `view`, or follows `path` (camera_path) from one stored view to the next.
+        With `sound` (a sound file's full path), the video carries it, from `sound_start` seconds
+        into it at the recording's start: the song the recording was made to."""
         self._show_path(name)
         if not isinstance(recording, str) or os.path.basename(recording) != recording or not recording.endswith(".dmxrec"):
             raise Problem("That recording does not exist.")
@@ -2911,10 +3317,37 @@ class Launcher:
         missing = sorted({key for key, _ in keys if key and key not in stored})
         if missing:
             raise Problem(f"{name[:-4]} has no view {' or '.join(str(key) for key in missing)} stored. Store views while watching (hold a number key), then render.")
+        if sound:
+            if not isinstance(sound, str) or not os.path.isabs(sound) or not sound.lower().endswith(self.SOUND_ENDINGS):
+                raise Problem("Choose a sound file (WAV, MP3, AAC, AIFF or FLAC).")
+            if not os.path.isfile(sound):
+                raise Problem(f"{os.path.basename(sound)} is no longer there.")
+            if isinstance(sound_start, bool) or not isinstance(sound_start, (int, float)) or sound_start != sound_start or not -3600 <= sound_start <= 3600:
+                raise Problem("Where the sound starts is a number of seconds, within an hour.")
         os.makedirs(self.videos_dir, exist_ok=True)
-        out = os.path.join(self.videos_dir, f"{name[:-4]} - {recording[:-7]} {time.strftime('%Y-%m-%d %H%M%S')}.mov")
-        return self.launch("show", name, render={"recording": take, "out": out, "rate": rate, "view": keys[0][0],
-                                                 "path": ",".join(f"{key}@{seconds:g}" for key, seconds in keys)})
+        stamp = time.strftime('%Y-%m-%d %H%M%S')
+        out = os.path.join(self.videos_dir, f"{name[:-4]} - {recording[:-7]} {stamp}.mov")
+        settings = {"recording": take, "out": out, "rate": rate, "view": keys[0][0], "path": ",".join(f"{key}@{seconds:g}" for key, seconds in keys)}
+        if sound:
+            settings.update(sound=self._sound_for_video(sound, os.path.join(self.videos_dir, f".sound {stamp}.wav")), sound_start=float(sound_start))
+        return self.launch("show", name, render=settings)
+
+    @staticmethod
+    def _sound_for_video(source, target):
+        """The sound as a WAV of 16-bit samples, which is what goes into a movie: made by the system's
+        converter, or the file itself where it is a WAV and there is none."""
+        command = oslayer.sound_converter(source, target)
+        if command is None:
+            if source.lower().endswith(".wav"):
+                return source
+            raise Problem("Only WAV files can be used here: Openviz converts other sound files with FFmpeg, which is not installed (winget install ffmpeg).")
+        try:
+            done = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=600)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise Problem(f"The sound could not be read: {error}") from None
+        if done.returncode != 0 or not os.path.isfile(target):
+            raise Problem(f"The sound could not be read: {(done.stderr or done.stdout).strip()[-300:] or 'the converter gave no reason'}")
+        return target
 
     def show_names(self):
         """The shows in the library, by name, for choosing one to render on."""
@@ -2927,7 +3360,9 @@ class Launcher:
         while run["process"].poll() is None:
             time.sleep(1.0)
             self._follow_videos(run)
+            self._follow_panoramas(run)
         self._follow_videos(run)
+        self._follow_panoramas(run)
         render = run.get("render")
         if render and os.path.exists(render["out"] + ".part"):
             os.remove(render["out"] + ".part")    # a render that ended before its movie was whole leaves no half a movie
@@ -2944,11 +3379,78 @@ class Launcher:
                 if path in self._videos:
                     continue
                 self._videos[path] = {"state": "converting", "file": os.path.basename(path), "error": "", "run": run["started"]}
-            threading.Thread(target=self._convert_video, args=(path,), daemon=True).start()
+            threading.Thread(target=self._convert_video, args=(path, run.get("render")), daemon=True).start()
 
-    def _convert_video(self, path):
+    def _follow_panoramas(self, run):
+        """Finds the six views the visualizer has said it took for a 360-degree picture, and has each set stitched once."""
+        try:
+            with open(run["log"], encoding="utf-8", errors="replace") as handle:
+                saved = [found.groups() for found in (re.search(r"LvShow: panorama: views saved: (.+) \((\d+) wide\)", line) for line in handle) if found]
+        except OSError:
+            return
+        for prefix, width in saved:
+            with self._lock:
+                if prefix in self._panoramas:
+                    continue
+                self._panoramas[prefix] = {"state": "stitching", "file": "", "error": "", "run": run["started"]}
+            threading.Thread(target=self._stitch_panorama, args=(prefix, int(width)), daemon=True).start()
+
+    def _stitch_panorama(self, prefix, width):
+        """The six views made into one 360-degree picture by the core; where the system can, a JPEG
+        that says what it is, so that photo sites and players show it as one to look round in."""
+        entry = self._panoramas[prefix]
+        base = prefix.rstrip()
+        base = base[:-len(" view")] if base.endswith(" view") else base
+        png = base + ".png"
+        try:
+            done = subprocess.run([self.inspector, "--panorama", prefix, png, str(width)], capture_output=True, text=True, errors="replace", timeout=600)
+            stitched = done.returncode == 0 and os.path.isfile(png)
+        except (OSError, subprocess.TimeoutExpired):
+            stitched = False
+        if not stitched:
+            entry.update(state="done", error="The six views could not be made into one picture; they are kept in the pictures folder.")
+            return
+        for face in range(6):
+            with contextlib.suppress(OSError):
+                os.remove(f"{prefix}{face}.png")
+        made = png
+        command = oslayer.jpeg_converter(png, base + ".jpg")
+        if command:
+            try:
+                converted = subprocess.run(command, capture_output=True, timeout=600).returncode == 0 and os.path.isfile(base + ".jpg")
+            except (OSError, subprocess.TimeoutExpired):
+                converted = False
+            if converted:
+                with open(base + ".jpg", "rb") as handle:
+                    marked = panorama_jpeg(handle.read(), width, width // 2)
+                with open(base + ".jpg", "wb") as handle:
+                    handle.write(marked)
+                os.remove(png)
+                made = base + ".jpg"
+        entry.update(state="done", file=os.path.basename(made))
+
+    def _convert_video(self, path, render=None):
         entry = self._videos[path]
         target = path[:-4] + ".mp4"
+        if render and render.get("sound") and render.get("out") == path and os.path.isfile(path):
+            # The render's sound, put in beside the pictures by the core, before the movie is made smaller.
+            entry["state"] = "adding sound"
+            loud = path[:-4] + " sound.mov"
+            try:
+                done = subprocess.run([self.inspector, "--movie-sound", path, render["sound"], f"{render.get('sound_start', 0.0):g}", loud],
+                                      capture_output=True, text=True, errors="replace", timeout=6 * 3600)
+                added = done.returncode == 0 and os.path.isfile(loud)
+            except (OSError, subprocess.TimeoutExpired):
+                added = False
+            if added:
+                os.replace(loud, path)
+            else:
+                entry["error"] = "The sound could not be added, so the video is silent."
+                if os.path.exists(loud):
+                    os.remove(loud)
+            if os.path.basename(render["sound"]).startswith(".sound "):
+                os.remove(render["sound"])    # the converted copy made for this render
+            entry["state"] = "converting"
         command = oslayer.video_converter(path, target) if os.path.isfile(path) else None
         if not command:    # kept as it was made
             entry.update(state="done", error="" if oslayer.MAC or not os.path.isfile(path) else
@@ -2966,7 +3468,8 @@ class Launcher:
         else:
             if os.path.exists(target):
                 os.remove(target)
-            entry.update(state="done", error="It could not be made smaller, so it is kept as it was made (JPEG pictures, which take more room).")
+            entry.update(state="done", error=(entry.get("error", "") + " " if entry.get("error") else "") +
+                         "It could not be made smaller, so it is kept as it was made (JPEG pictures, which take more room).")
 
     def videos(self):
         """The videos made, newest first, and those being made into H.264 now."""
@@ -2975,7 +3478,7 @@ class Launcher:
             names = os.listdir(self.videos_dir)
         except OSError:
             names = []
-        busy = {os.path.basename(path) for path, entry in self._videos.items() if entry["state"] == "converting"}
+        busy = {os.path.basename(path) for path, entry in self._videos.items() if entry["state"] in ("converting", "adding sound")}
         for entry in names:
             path = os.path.join(self.videos_dir, entry)
             if not entry.lower().endswith((".mp4", ".mov")) or not os.path.isfile(path):
@@ -3000,6 +3503,10 @@ class Launcher:
             ok = value == "" or value in self.PICTURE_SIZES
         elif command == "record":
             ok = value in ("start", "stop")
+        elif command == "panorama":
+            ok = value in ("4096", "8192")
+        elif command == "meter":
+            ok = value in ("on", "off", "toggle")
         else:
             ok = False
         if not ok:
@@ -3025,7 +3532,9 @@ class Launcher:
         ("/openviz/view/side", "a button: the side elevation"),
         ("/openviz/store", "1 to 9: store the present view there"),
         ("/openviz/picture", "a button: a picture as on screen; 4 or 8: at 4K or 8K"),
+        ("/openviz/panorama", "a button: a 360-degree picture from where the camera stands, 8192 wide; 4: 4096 wide"),
         ("/openviz/record", "a toggle: 1 starts recording a video, 0 stops it"),
+        ("/openviz/meter", "a toggle: 1 shows the light levels on stage in lux, 0 hides them"),
         ("/openviz/exposure", "stops, -16 to 8"),
         ("/openviz/haze", "0 to 1 as a fader, or 2 to 250 as the percentage the Visualizer page shows"),
         ("/openviz/drift", "0 (even) to 1 (heavy)"),
@@ -3052,6 +3561,18 @@ class Launcher:
                 except OSError as error:
                     self._osc_trouble = f"Port {settings['osc_port']} cannot be listened on ({error.strerror or error}): something else has it. Choose another."
         return self.osc_state()
+
+    def psn_state(self):
+        """PosiStageNet: whether it is heard, where, and the trackers and systems heard just now."""
+        settings = self.settings()
+        monitor = self._monitor() if settings["psn"] else None
+        relay = self.relay_state()
+        state = {"on": settings["psn"], "group": settings["psn_group"], "port": settings["psn_port"], "relay": relay,
+                 "running": bool(settings["psn"] and relay["running"]), "trackers": [], "systems": []}
+        if monitor and isinstance(monitor.get("psn"), dict):
+            state["trackers"] = monitor["psn"].get("trackers", [])
+            state["systems"] = monitor["psn"].get("systems", [])
+        return state
 
     def osc_state(self):
         settings = self.settings()
@@ -3090,7 +3611,7 @@ class Launcher:
             if not path.startswith("/openviz/"):
                 result = "not for Openviz: its addresses begin /openviz/"
             elif number == 0.0 and arguments and len(arguments) == 1 and not isinstance(arguments[0], str) and path in (
-                    "/openviz/view/top", "/openviz/view/front", "/openviz/view/side", "/openviz/picture"):
+                    "/openviz/view/top", "/openviz/view/front", "/openviz/view/side", "/openviz/picture", "/openviz/panorama"):
                 result = "a button let go: nothing to do"
             elif path in ("/openviz/view/top", "/openviz/view/front", "/openviz/view/side"):
                 self.visualizer("view", path.rsplit("/", 1)[1])
@@ -3126,6 +3647,19 @@ class Launcher:
                     size = word
                 self.visualizer("picture", size)
                 result = f"picture {size or 'as on screen'}"
+            elif path == "/openviz/meter":
+                if word in ("on", "off", "toggle"):
+                    value = word
+                elif number is not None:
+                    value = "on" if number >= 0.5 else "off"
+                else:
+                    raise Problem("Send 1 to show the light levels and 0 to hide them.")
+                self.visualizer("meter", value)
+                result = f"light levels {value}"
+            elif path == "/openviz/panorama":
+                width = "4096" if number == 4.0 or word == "4096" else "8192"
+                self.visualizer("panorama", width)
+                result = f"360-degree picture {width} wide"
             elif path in ("/openviz/exposure", "/openviz/haze", "/openviz/drift", "/openviz/houselights", "/openviz/beamdetail"):
                 if number is None:
                     raise Problem("A number is expected.")
@@ -3354,6 +3888,27 @@ class Launcher:
             rows.append(dict(known[2], name=name, size=stat.st_size))
         return rows
 
+    def trim_recording(self, name, start, end):
+        """Keeps a part of a recording as a recording of its own, `start` to `end` seconds: the
+        chorus of a song, say, to render. The recording itself is left as it is."""
+        if not isinstance(name, str) or os.path.basename(name) != name or not name.endswith(".dmxrec"):
+            raise Problem("That recording is not in the library.")
+        path = os.path.join(self.recordings_dir, name)
+        if not os.path.isfile(path):
+            raise Problem(f"{name} is no longer in the library.")
+        for value in (start, end):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value < 0:
+                raise Problem("The start and the end are numbers of seconds, 0 or more.")
+        if end <= start:
+            raise Problem("The end must come after the start.")
+        stem = name[:-len(".dmxrec")]
+        target = os.path.join(self.recordings_dir, f"{stem} {start:g}-{end:g}s.dmxrec")
+        try:
+            facts = dmx_record.trim(path, target, float(start), float(end))
+        except (OSError, ValueError) as error:
+            raise Problem(f"The part could not be kept: {error}") from None
+        return dict(facts, name=os.path.basename(target))
+
     def play_start(self, name, loop=True, to=None):
         """Plays a recording to the visualizer, as Art-Net, the way a console would send it."""
         if not isinstance(name, str) or os.path.basename(name) != name or not name.endswith(".dmxrec"):
@@ -3427,6 +3982,21 @@ class Launcher:
         except OSError as error:
             raise Problem(f"The folder could not be opened: {error}") from None
         return {"folder": folder}
+
+
+def panorama_jpeg(jpeg, width, height):
+    """A JPEG with the XMP that says it is a 360-degree picture (Google's GPano, which photo sites,
+    players and headsets read), put just after its start."""
+    if jpeg[:2] != b"\xff\xd8":
+        return jpeg
+    xmp = ('<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/">'
+           '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" '
+           'xmlns:GPano="http://ns.google.com/photos/1.0/panorama/" GPano:ProjectionType="equirectangular" GPano:UsePanoramaViewer="True" '
+           f'GPano:FullPanoWidthPixels="{width}" GPano:FullPanoHeightPixels="{height}" GPano:CroppedAreaImageWidthPixels="{width}" '
+           f'GPano:CroppedAreaImageHeightPixels="{height}" GPano:CroppedAreaLeftPixels="0" GPano:CroppedAreaTopPixels="0"/>'
+           '</rdf:RDF></x:xmpmeta><?xpacket end="w"?>').encode("utf-8")
+    body = b"http://ns.adobe.com/xap/1.0/\x00" + xmp
+    return jpeg[:2] + b"\xff\xe1" + (len(body) + 2).to_bytes(2, "big") + body + jpeg[2:]
 
 
 def bare_type(spec):
@@ -3592,7 +4162,9 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js",
 UNDOABLE = {
     "/api/edits/discard": "Discard Edits", "/api/show/add": "Add Fixtures", "/api/show/set": "Edit Fixtures",
     "/api/types/remove": "Remove Fixture Type", "/api/types/set": "Replace Fixture Type", "/api/types/clear": "Revert Fixture Type",
-    "/api/types/moves": "Fixture Type Movement", "/api/types/share": "Replace Fixture Type", "/api/types/all": "Auto-Match Fixture Types",
+    "/api/types/moves": "Fixture Type Movement", "/api/types/curve": "Dimmer Curve", "/api/types/share": "Replace Fixture Type", "/api/types/all": "Auto-Match Fixture Types",
+    "/api/builder/build": "Build Fixture Type",
+    "/api/screen/stream": "Rename NDI Stream", "/api/group/add": "Add Group", "/api/group/set": "Change Group", "/api/group/remove": "Remove Group",
     "/api/piece/add": "Add Set Piece", "/api/piece/set": "Edit Set Piece", "/api/piece/remove": "Remove Set Piece",
     "/api/screen/set": "Edit Screen", "/api/screen/add": "Add Screen", "/api/screen/remove": "Remove Screen",
     "/api/screen/split": "Split Screen", "/api/screen/section": "Edit Screen Section", "/api/screen/wall": "Convert LED Wall to Screen",
@@ -3628,7 +4200,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         # A preview of a PDF is shown in a frame from a blob of the page's own making.
-        self.send_header("Content-Security-Policy", "default-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' blob:; frame-src 'self' blob:; frame-ancestors 'none'")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -3701,14 +4273,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return launcher.screens(query.get("name", [""])[0])
             if path == "/api/osc":
                 return launcher.osc_state()
+            if path == "/api/psn":
+                return launcher.psn_state()
             if path == "/api/paper":
                 return launcher.paper_settings(query.get("name", [""])[0])
             if path == "/api/export/preview":
                 return launcher.preview_paper(query.get("name", [""])[0], query.get("what", [""])[0], query.get("paper", [""])[0], query.get("units", [""])[0])
+            if path == "/api/show/groups":
+                return launcher.groups(query.get("name", [""])[0])
             if path == "/api/show/pieces":
                 return launcher.pieces(query.get("name", [""])[0])
             if path == "/api/show/types":
                 return launcher.show_types(query.get("name", [""])[0])
+            if path == "/api/fixtures/thumbnail":
+                return launcher.fixture_thumbnail(query.get("file", [""])[0])
+            if path == "/api/builder":
+                return launcher.builder(query.get("name", [""])[0], query.get("type", [""])[0], query.get("file", [""])[0])
             if path == "/api/types/find":
                 return launcher.share_for_type(query.get("name", [""])[0], query.get("type", [""])[0])
             if path == "/api/ndi":
@@ -3756,6 +4336,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return launcher.record_start()
         if path == "/api/record/stop":
             return launcher.record_stop()
+        if path == "/api/recording/trim":
+            return launcher.trim_recording(body.get("name"), body.get("start"), body.get("end"))
         if path == "/api/play/start":
             return launcher.play_start(body.get("name"), bool(body.get("loop", True)))
         if path == "/api/play/stop":
@@ -3789,20 +4371,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return launcher.remove_type(body.get("name"), body.get("type"), bool(body.get("restore")))
         if path == "/api/show/update":
             return launcher.update_show(body.get("name"), body.get("newer"))
+        if path == "/api/fixtures/update":
+            return launcher.update_fixture(body.get("file"))
+        if path == "/api/builder/template":
+            return launcher.builder_template(body.get("template"), body.get("spec"), body.get("keep_modes"))
+        if path == "/api/builder/build":
+            return launcher.build_fixture(body.get("spec"), body.get("name") or "", body.get("type") or "")
         if path == "/api/types/set":
             return launcher.set_stand_in(body.get("name"), body.get("type"), body.get("file"))
         if path == "/api/types/clear":
             return launcher.clear_stand_in(body.get("name"), body.get("type"))
+        if path == "/api/types/curve":
+            return launcher.set_type_curve(body.get("name"), body.get("type"), body.get("curve"))
         if path == "/api/types/moves":
             return launcher.set_type_moves(body.get("name"), body.get("type"), body.get("invert_pan", False), body.get("invert_tilt", False),
                                            body.get("pan_offset", 0.0), body.get("tilt_offset", 0.0))
         if path == "/api/osc":
             launcher.update_settings({key: body[key] for key in ("osc", "osc_port") if key in body})
             return launcher.osc_apply()
+        if path == "/api/psn":
+            launcher.update_settings({key: body[key] for key in ("psn", "psn_group", "psn_port") if key in body})
+            return launcher.psn_state()
         if path == "/api/visualizer":
             return launcher.visualizer(body.get("command"), body.get("value", ""))
         if path == "/api/show/set":
             return launcher.set_fixtures(body.get("name"), body.get("uuids"), body.get("changes"))
+        if path == "/api/screen/stream":
+            return launcher.rename_stream(body.get("name"), body.get("old"), body.get("new"))
+        if path == "/api/group/add":
+            return launcher.add_group(body.get("name"), body.get("group"), body.get("uuids"))
+        if path == "/api/group/set":
+            return launcher.set_group(body.get("name"), body.get("id"), body.get("changes"))
+        if path == "/api/group/remove":
+            return launcher.remove_group(body.get("name"), body.get("id"))
         if path == "/api/piece/add":
             return launcher.add_piece(body.get("name"), body.get("kind"), body.get("changes"))
         if path == "/api/piece/set":
@@ -3831,6 +4432,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return launcher.add_screen(body.get("name"), body.get("screen"))
         if path == "/api/screen/remove":
             return launcher.remove_screen(body.get("name"), body.get("id"))
+        if path == "/api/sound/choose":
+            return launcher.choose_file("sound")
         if path == "/api/screen/choose":
             return launcher.choose_file(body.get("kind"))
         if path == "/api/model/choose":
@@ -3842,7 +4445,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/stop":
             return launcher.stop()
         if path == "/api/render":
-            return launcher.render(body.get("name"), body.get("recording"), body.get("rate", 30), body.get("view", 0), body.get("path", ""))
+            return launcher.render(body.get("name"), body.get("recording"), body.get("rate", 30), body.get("view", 0), body.get("path", ""),
+                                   body.get("sound") or "", body.get("sound_start", 0.0))
         if path == "/api/reveal":
             return launcher.reveal(body.get("what"))
         if path == "/api/quit":
@@ -3871,6 +4475,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             result = self._route(method, parts.path, urllib.parse.parse_qs(parts.query))
             if isinstance(result, PdfBytes):
                 self._send(200, bytes(result), "application/pdf")
+            elif isinstance(result, PictureBytes):
+                self._send(200, bytes(result), result.content_type)
             else:
                 self._send(200, result)
         except Problem as problem:

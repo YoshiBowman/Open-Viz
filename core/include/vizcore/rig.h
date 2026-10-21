@@ -48,9 +48,10 @@ struct TypeSwap {
     bool invert_tilt = false;
     double pan_offset = 0.0;                                   // degrees
     double tilt_offset = 0.0;
+    DimmerCurve dimmer = DimmerCurve::Linear;                  // how its dimmer's level becomes light
 
     bool stands_in() const { return !file.empty(); }
-    bool corrects() const { return invert_pan || invert_tilt || pan_offset != 0.0 || tilt_offset != 0.0; }
+    bool corrects() const { return invert_pan || invert_tilt || pan_offset != 0.0 || tilt_offset != 0.0 || dimmer != DimmerCurve::Linear; }
     VIZCORE_API const std::string* mode_for(std::string_view mode) const;    // null if the mode has no counterpart
     VIZCORE_API const std::string* mode_back(std::string_view mode) const;   // the other way, for an export
 };
@@ -70,8 +71,10 @@ struct TypeSwaps {
     // stand-in away, keeping the entry only if it still corrects something (false if it had none).
     VIZCORE_API void set_stand_in(std::string_view gdtf_spec, std::string file, std::vector<std::pair<std::string, std::string>> modes);
     VIZCORE_API bool clear_stand_in(std::string_view gdtf_spec);
-    // Sets a type's pan and tilt corrections and leaves its stand-in as it is.
+    // Sets a type's pan and tilt corrections and leaves its stand-in and dimmer curve as they are.
     VIZCORE_API void correct(std::string_view gdtf_spec, bool invert_pan, bool invert_tilt, double pan_offset, double tilt_offset);
+    // Sets a type's dimmer curve and leaves the rest as it is.
+    VIZCORE_API void set_dimmer_curve(std::string_view gdtf_spec, DimmerCurve curve);
     bool empty() const { return swaps.empty(); }
 };
 
@@ -129,6 +132,7 @@ struct RigFixture {
     bool invert_tilt = false;
     double pan_offset = 0.0;
     double tilt_offset = 0.0;
+    DimmerCurve dimmer = DimmerCurve::Linear;    // its type's dimmer curve in this show
     bool own_invert_pan = false;  // the fixture's own inversion alone, as the file or an edit has it
     bool own_invert_tilt = false;
 

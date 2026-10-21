@@ -19,7 +19,13 @@ here on every address and passed to Unreal, which listens on this computer's own
 
 Either way Unreal receives Art-Net through its own DMX plugin, with the universe numbers as sent.
 
+PosiStageNet (with --psn): where a tracking system says tracked things are. Its multicast group
+is joined here on the same interface, for the same reason as sACN's, and every packet is passed
+on as it came to Unreal on 127.0.0.1 (port 56566 unless --psn-to says otherwise), where the
+visualizer reads it (vizcore/psn.h). The monitor file lists the trackers heard.
+
   dmx_relay.py --protocol sacn --interface 192.168.1.45 --universes 116 --while-pid 4242
+  dmx_relay.py --protocol sacn --interface 192.168.1.45 --psn 236.10.10.10:56565
 
 --monitor FILE   twice a second, write what is arriving to FILE as JSON (see Relay.snapshot)
 --control FILE   read orders from FILE, a JSON object, whenever it changes:
@@ -44,13 +50,18 @@ sys.path.insert(0, HERE)
 import oslayer  # noqa: E402
 
 import dmx_record  # noqa: E402
+import psn  # noqa: E402
 from dmx_packets import ARTNET_PORT, SACN_PORT, artdmx, parse_artdmx, parse_sacn, whole  # noqa: E402
 
 SOURCE_TIMEOUT = 2.5    # E1.31's network data loss timeout: a source silent this long is gone
+PSN_TO_PORT = psn.VISUALIZER_PORT    # where the visualizer listens, on 127.0.0.1, for the PosiStageNet passed on
 
 
 class Relay:
-    def __init__(self, interface, universes, listen_port=None, to=("127.0.0.1", ARTNET_PORT), protocol="sacn"):
+    def __init__(self, interface, universes, listen_port=None, to=("127.0.0.1", ARTNET_PORT), protocol="sacn", psn_from=None,
+                 psn_to=("127.0.0.1", PSN_TO_PORT)):
+        """`psn_from`: (group, port) to hear PosiStageNet on, the group "" for packets sent to this
+        computer's own address only; None not to."""
         self.protocol = protocol
         self.interface = interface
         self.to = to
@@ -63,6 +74,13 @@ class Relay:
         self.recording = None  # a dmx_record.Writer while recording
         self.record_started = 0.0
         self.record_error = ""
+        self.psn_socket = None
+        self.psn_from = psn_from
+        self.psn_to = psn_to
+        self.psn_passed = 0
+        self.psn_other = 0
+        self.psn_seen = {}      # tracker id -> what the monitor shows of it (see handle_psn)
+        self.psn_systems = {}   # address -> (system name, last heard)
         self.out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.out.bind(("127.0.0.1", 0))    # known, so that what is sent from it can be told apart if it comes back
         if listen_port is None:    # 0 is a port too: any free one, as the tests ask for
@@ -78,6 +96,12 @@ class Relay:
             else:
                 sock = self._listener(listen_port)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            if psn_from:
+                group, port = psn_from
+                self.psn_socket = self._listener(port)
+                self.sockets.remove(self.psn_socket)    # read on its own: see run()
+                if group:
+                    self.psn_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(group) + socket.inet_aton(interface))
         except OSError:
             self.close()
             raise
@@ -99,9 +123,10 @@ class Relay:
 
     def close(self):
         self.record(None)
-        for sock in self.sockets + [self.out]:
+        for sock in self.sockets + [self.out] + ([self.psn_socket] if self.psn_socket else []):
             sock.close()
         self.sockets = []
+        self.psn_socket = None
 
     # ------------------------------------------------------------------------------- passing on
 
@@ -157,6 +182,47 @@ class Relay:
                 self.recording = None
         return True
 
+    def handle_psn(self, data, now, sender=("", 0)):
+        """Passes one PosiStageNet datagram on to the visualizer as it came, and notes its trackers."""
+        if sender[0] == "127.0.0.1" and sender[1] == self.out.getsockname()[1]:
+            return False    # our own, come back
+        packet = psn.parse(data)
+        if not packet:
+            self.psn_other += 1
+            return False
+        try:
+            self.out.sendto(data, self.psn_to)
+        except OSError:
+            return False
+        self.psn_passed += 1
+        if packet["kind"] == "info":
+            self.psn_systems[sender[0]] = (packet["system"], now)
+        for number, tracker in packet["trackers"].items():
+            row = self.psn_seen.setdefault(number, {"name": "", "position": None, "heard": None, "packets": 0, "since": now, "rate": 0.0, "source": sender[0]})
+            if packet["kind"] == "info":
+                row["name"] = tracker.get("name", "")
+            elif "position" in tracker:
+                row.update(position=tracker["position"], heard=now, source=sender[0])
+                row["packets"] += 1
+        return True
+
+    def _psn_snapshot(self, now):
+        trackers = []
+        for number in sorted(self.psn_seen):
+            row = self.psn_seen[number]
+            elapsed = now - row["since"]
+            if elapsed >= 0.4:
+                row["rate"] = row["packets"] / elapsed
+                row["packets"] = 0
+                row["since"] = now
+            if row["heard"] is None or now - row["heard"] > SOURCE_TIMEOUT:
+                continue
+            trackers.append({"id": number, "name": row["name"], "position": [round(value, 3) for value in row["position"]],
+                             "rate": round(row["rate"], 1), "source": row["source"]})
+        systems = [{"address": address, "name": name} for address, (name, heard) in sorted(self.psn_systems.items()) if now - heard <= 5.0]
+        group, port = self.psn_from
+        return {"group": group, "port": port, "trackers": trackers, "systems": systems, "passed": self.psn_passed, "other": self.psn_other}
+
     def _note(self, universe, now, address, name, priority, passed_levels):
         """Keeps what the monitor shows of a universe: who sends it, how often, and what was last passed on."""
         row = self.seen.get(universe)
@@ -203,6 +269,8 @@ class Relay:
             state["record_error"] = self.record_error
         if watch and watch in self.seen:
             state["watch"] = {"universe": watch, "levels": list(self.seen[watch]["levels"])}
+        if self.psn_from:
+            state["psn"] = self._psn_snapshot(now)
         return state
 
     def record(self, path, now=None):
@@ -226,7 +294,7 @@ class Relay:
         orders_stamp = None
         next_report = 0.0
         while keep_going(orders):
-            ready = select.select(self.sockets, [], [], poll)[0]
+            ready = select.select(self.sockets + ([self.psn_socket] if self.psn_socket else []), [], [], poll)[0]
             now = time.monotonic()
             seen = set()    # a datagram for a group reaches every socket here; pass it on once
             for sock in ready:
@@ -235,6 +303,9 @@ class Relay:
                         data, sender = sock.recvfrom(2048)
                     except BlockingIOError:
                         break
+                    if sock is self.psn_socket:
+                        self.handle_psn(data, now, sender)
+                        continue
                     if len(self.sockets) > 1:
                         key = (data[22:38], data[111:115])    # source, sequence number and universe
                         if key in seen:
@@ -277,13 +348,25 @@ def main(argv=None):
     p.add_argument("--parent-pid", type=int, help="keep going while this process lives, whatever --while-pid says")
     p.add_argument("--monitor", help="write what is arriving to this file, twice a second")
     p.add_argument("--control", help="read orders from this file")
+    p.add_argument("--psn", metavar="GROUP:PORT", help="also hear PosiStageNet there (the group empty for this computer's own address only)")
+    p.add_argument("--psn-to", type=int, default=PSN_TO_PORT, help=f"pass PosiStageNet on to this port on 127.0.0.1 (default {PSN_TO_PORT})")
     p.add_argument("--listen-port", type=int, help=argparse.SUPPRESS)    # for the tests
     p.add_argument("--to-port", type=int, default=ARTNET_PORT, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    psn_from = None
+    if args.psn:
+        group, _, port = args.psn.rpartition(":")
+        try:
+            psn_from = (group, int(port))
+        except ValueError:
+            print(f"error: --psn wants GROUP:PORT, not {args.psn}", file=sys.stderr)
+            return 1
     try:
-        relay = Relay(args.interface, max(1, min(args.universes, 2000)), args.listen_port, ("127.0.0.1", args.to_port), args.protocol)
+        relay = Relay(args.interface, max(1, min(args.universes, 2000)), args.listen_port, ("127.0.0.1", args.to_port), args.protocol,
+                      psn_from, ("127.0.0.1", args.psn_to))
     except OSError as error:
-        print(f"error: cannot listen for {'sACN' if args.protocol == 'sacn' else 'Art-Net'} on {args.interface}: {error}", file=sys.stderr)
+        what = ("sACN" if args.protocol == "sacn" else "Art-Net") + (" and PosiStageNet" if psn_from else "")
+        print(f"error: cannot listen for {what} on {args.interface}: {error}", file=sys.stderr)
         return 1
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(True))

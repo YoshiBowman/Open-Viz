@@ -174,6 +174,32 @@ UTexture2D* ULvFixtureLibrary::GetOpenHole()
 	return OpenHole;
 }
 
+UTexture2D* ULvFixtureLibrary::GetSplitColours(const FLinearColor& Left, const FLinearColor& Right)
+{
+	auto Rounded = [](float Value) { return FMath::RoundToInt(FMath::Clamp(Value, 0.0f, 1.0f) * 255.0f); };
+	const FString Key = FString::Printf(TEXT("%d,%d,%d|%d,%d,%d"), Rounded(Left.R), Rounded(Left.G), Rounded(Left.B), Rounded(Right.R), Rounded(Right.G), Rounded(Right.B));
+	if (TObjectPtr<UTexture2D>* Found = SplitColours.Find(Key))
+	{
+		return Found->Get();
+	}
+	TArray<FVector3f> Pixels;
+	Pixels.SetNumUninitialized(PictureSide * PictureSide);
+	for (int32 X = 0; X < PictureSide; ++X)
+	{
+		// The line between the two is a few hundredths of the beam wide: a slot's edge is out of focus.
+		const float U = (X + 0.5f) / PictureSide * 2.0f - 1.0f;
+		const float Share = FMath::SmoothStep(-0.04f, 0.04f, U);
+		const FVector3f Colour(FMath::Lerp(Left.R, Right.R, Share), FMath::Lerp(Left.G, Right.G, Share), FMath::Lerp(Left.B, Right.B, Share));
+		for (int32 Y = 0; Y < PictureSide; ++Y)
+		{
+			Pixels[Y * PictureSide + X] = Colour;
+		}
+	}
+	UTexture2D* Texture = BuildPictureTexture(MoveTemp(Pixels), PictureSide);
+	SplitColours.Add(Key, Texture);
+	return Texture;
+}
+
 int32 FLvFixtureDefinition::FindMode(const FString& ModeName) const
 {
 	return Type.find_mode(LvToStd(ModeName));
@@ -308,6 +334,20 @@ UStaticMesh* ULvFixtureLibrary::GetSceneryMesh(const FString& Key, TFunctionRef<
 	UStaticMesh* Built = Shape.ok ? LvBuildStaticMesh(Shape.mesh, this, GetSceneryMaterial(), true, GetModelMaterials(Shape.mesh, false)) : nullptr;
 	SceneryMeshes.Add(Key, Built);
 	return Built;
+}
+
+UMaterialInterface* ULvFixtureLibrary::GetShadowBeam()
+{
+	if (!bShadowBeamTried)
+	{
+		bShadowBeamTried = true;
+		ShadowBeam = LoadObject<UMaterialInterface>(nullptr, TEXT("/LightingVisualizer/Materials/M_LvBeamShadow.M_LvBeamShadow"));
+		if (!ShadowBeam)
+		{
+			UE_LOG(LogLvFixtures, Warning, TEXT("M_LvBeamShadow is missing (tools/build_materials.py builds it): what stands in a beam does not shade it in haze"));
+		}
+	}
+	return ShadowBeam;
 }
 
 UStaticMesh* ULvFixtureLibrary::GetBeamCone()

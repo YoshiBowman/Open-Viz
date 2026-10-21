@@ -31,7 +31,16 @@
 #include "LvStage.h"
 #include "LvCoordinates.h"
 #include "vizcore/dmx_recording.h"
+#include "vizcore/movie.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "Modules/ModuleManager.h"
 #include "vizcore/pieces.h"
+#include "vizcore/psn.h"
+#include "LvLightMeter.h"
+#include "IPAddress.h"
+#include "Sockets.h"
+#include "SocketSubsystem.h"
 #include "LvVideo.h"
 #include "HAL/FileManager.h"
 #include "Misc/App.h"
@@ -93,6 +102,14 @@ namespace
 				Setting.Colour = FLinearColor(static_cast<float>((*Colour)[0]->AsNumber()), static_cast<float>((*Colour)[1]->AsNumber()), static_cast<float>((*Colour)[2]->AsNumber()));
 			}
 			(*Object)->TryGetStringField(TEXT("picture"), Setting.Picture);
+			// A tracker to follow: as the core reads it (vizcore/pieces.h), a number up to 65535 or the entry is not used.
+			double Tracker = 0.0;
+			if ((*Object)->TryGetNumberField(TEXT("tracker"), Tracker) && (Tracker < 0.0 || Tracker > 65535.0))
+			{
+				continue;
+			}
+			Setting.Tracker = static_cast<int32>(Tracker);
+			(*Object)->TryGetBoolField(TEXT("follow_height"), Setting.bFollowHeight);
 			if (Setting.Kind == TEXT("model"))
 			{
 				// Its file is a plain name in Openviz's models folder, beside the fixture library.
@@ -173,6 +190,15 @@ void ULvShowSubsystem::Start(UWorld& InWorld)
 	FParse::Value(CommandLine, TEXT("LvExposure="), Exposure);
 	ExposureNow = FMath::Clamp(Exposure, -16.0f, 8.0f);
 	LvStage::Build(InWorld, ExposureNow);
+	FParse::Value(CommandLine, TEXT("LvFloor="), FloorRoughness);
+	FParse::Value(CommandLine, TEXT("LvFloorShade="), FloorShade);
+	FParse::Value(CommandLine, TEXT("LvBloom="), BloomNow);
+	bMotionBlur = IntOption(TEXT("LvMotionBlur="), 1) != 0;
+	FloorRoughness = FMath::Clamp(FloorRoughness, 0.0f, 1.0f);
+	FloorShade = FMath::Clamp(FloorShade, 0.0f, 1.0f);
+	BloomNow = FMath::Clamp(BloomNow, 0.0f, 4.0f);
+	LvStage::SetFloor(InWorld, FloorShade, FloorRoughness);
+	LvStage::SetLook(InWorld, BloomNow, bMotionBlur);
 	// Openviz's picture settings, for what is changed there while the show is open. What they
 	// say when the show starts is what the command line says: only later changes count.
 	FParse::Value(CommandLine, TEXT("LvPicture="), PictureFile, false);
@@ -207,6 +233,13 @@ void ULvShowSubsystem::Start(UWorld& InWorld)
 	{
 		ShowPath = MvrPath;
 		SpawnRig(InWorld, MvrPath);
+	}
+	// PosiStageNet as Openviz's receiver passes it on: set pieces given a tracker follow it while watching.
+	bMeterOnStart = IntOption(TEXT("LvMeter="), 0) != 0 && !bEditing;
+	const int32 PsnPort = IntOption(TEXT("LvPsnPort="), 0);
+	if (PsnPort > 0 && !bEditing)
+	{
+		OpenPsn(PsnPort);
 	}
 	else if (FParse::Value(CommandLine, TEXT("LvShowGdtf="), GdtfPath, false))
 	{
@@ -305,6 +338,8 @@ void ULvShowSubsystem::Start(UWorld& InWorld)
 	UE_LOG(LogLvShow, Display, TEXT("LvShow: listening for %s"), *Listening);
 
 	FParse::Value(CommandLine, TEXT("LvShot="), ShotPath, false);
+	FParse::Value(CommandLine, TEXT("LvPanorama="), PanoramaOnStart);
+	FParse::Value(CommandLine, TEXT("LvPanoramaAfter="), PanoramaOnStartAt);
 	FParse::Value(CommandLine, TEXT("LvShotAfter="), ShotAfter);
 	FParse::Value(CommandLine, TEXT("LvPictures="), PicturesFolder, false);
 	FParse::Value(CommandLine, TEXT("LvVideos="), VideosFolder, false);
@@ -313,6 +348,13 @@ void ULvShowSubsystem::Start(UWorld& InWorld)
 	{
 		FParse::Value(CommandLine, TEXT("LvRenderRate="), RenderRate);
 		FParse::Value(CommandLine, TEXT("LvRenderView="), RenderView);
+		FString Size;
+		FString Wide;
+		FString High;
+		if (FParse::Value(CommandLine, TEXT("LvRenderSize="), Size) && Size.Split(TEXT("x"), &Wide, &High))
+		{
+			RenderSize = FIntPoint(FMath::Clamp(FCString::Atoi(*Wide), 320, 8192) & ~1, FMath::Clamp(FCString::Atoi(*High), 180, 8192) & ~1);
+		}
 		RenderRate = FMath::Clamp(RenderRate, 1, 120);
 		RenderView = FMath::Clamp(RenderView, 0, 9);
 		FString Path;
@@ -550,6 +592,7 @@ void ULvShowSubsystem::Deinitialize()
 		FollowVideo();
 	}
 	ULvDmxSubsystem::ClearProvided();
+	ClosePsn();
 #if WITH_EDITOR
 	if (GEngine && ActorDeletedHandle.IsValid())
 	{
@@ -602,6 +645,17 @@ void ULvShowSubsystem::StepSelfTest()
 		else
 		{
 			UE_LOG(LogLvShow, Error, TEXT("LvShow: note: self-test needs three fixtures, the rig has %d"), Rig.Num());
+		}
+		// And a screen added in Openviz, if the show has one: half a metre up and a quarter turn about the vertical.
+		for (const TPair<TWeakObjectPtr<ALvScreenActor>, FTransform>& Placed : ScreensPlaced)
+		{
+			if (ALvScreenActor* Screen = Placed.Key.Get())
+			{
+				Screen->SetActorLocationAndRotation(Screen->GetActorLocation() + FVector(0.0, 0.0, 50.0),
+					FQuat(FVector::UpVector, UE_HALF_PI) * Screen->GetActorQuat());
+				UE_LOG(LogLvShow, Display, TEXT("LvShow: self-test: moved screen '%s'"), *Screen->ScreenName);
+				break;
+			}
 		}
 		SelfTestStage = 1;
 		SelfTestAt = Elapsed + 2.0;    // time for the save to happen by itself
@@ -703,13 +757,13 @@ void ULvShowSubsystem::SpawnRig(UWorld& World, const FString& MvrPath)
 	// The pictures on the show's screens. After the scenery: a screen's picture lies on the model the file draws it with.
 	const TArray<ALvScreenActor*> Pictures = SpawnScreens(World, MvrPath);
 
-	if (HiddenLayers.Num() > 0 || HiddenClasses.Num() > 0)
+	if (HiddenLayers.Num() > 0 || HiddenClasses.Num() > 0 || HiddenFixtureIds.Num() > 0)
 	{
 		int32 HiddenFixtures = 0;
 		int32 HiddenPieces = 0;
 		for (const TWeakObjectPtr<ALvFixtureActor>& Fixture : Fixtures)
 		{
-			HiddenFixtures += Fixture.IsValid() && IsHiddenByChoice(Fixture->Layer, Fixture->Class) ? 1 : 0;    // Start hides them, with everything else that decides it
+			HiddenFixtures += Fixture.IsValid() && IsFixtureHiddenByChoice(*Fixture) ? 1 : 0;    // Start hides them, with everything else that decides it
 		}
 		for (const TWeakObjectPtr<ALvSceneryActor>& Piece : Pieces)
 		{
@@ -723,7 +777,7 @@ void ULvShowSubsystem::SpawnRig(UWorld& World, const FString& MvrPath)
 		{
 			HiddenPieces += Picture && Picture->IsHidden() ? 1 : 0;    // SpawnScreens hid them
 		}
-		UE_LOG(LogLvShow, Display, TEXT("LvShow: %d fixture%s and %d set piece%s are hidden by layer or class"), HiddenFixtures,
+		UE_LOG(LogLvShow, Display, TEXT("LvShow: %d fixture%s and %d set piece%s are hidden by layer, class or group"), HiddenFixtures,
 			HiddenFixtures == 1 ? TEXT("") : TEXT("s"), HiddenPieces, HiddenPieces == 1 ? TEXT("") : TEXT("s"));
 	}
 }
@@ -738,15 +792,228 @@ void ULvShowSubsystem::SpawnPieces(UWorld& World)
 		}
 	}
 	AddedPieces.Reset();
+	Followers.Reset();
+	People.Reset();
 	PiecesStamp = PiecesFile.IsEmpty() ? FDateTime::MinValue() : IFileManager::Get().GetTimeStamp(*PiecesFile);
-	for (ALvSceneryActor* Piece : LvRig::SpawnPieces(World, ReadPieceSettings(PiecesFile, LibraryFolder)))
+	const TArray<FLvPieceSetting> Settings = ReadPieceSettings(PiecesFile, LibraryFolder);
+	for (ALvSceneryActor* Piece : LvRig::SpawnPieces(World, Settings))
 	{
 		AddedPieces.Add(Piece);
+		const FLvPieceSetting* Setting = Settings.FindByPredicate([Piece](const FLvPieceSetting& Entry) { return Entry.Id == Piece->PieceId; });
+		if (Setting && (Setting->Kind == TEXT("person") || Setting->Kind == TEXT("crowd")))
+		{
+			People.Add(Piece);
+		}
+		if (Setting && Setting->Tracker > 0)
+		{
+			FFollower& Follower = Followers.AddDefaulted_GetRef();
+			Follower.Actor = Piece;
+			Follower.Tracker = Setting->Tracker;
+			Follower.bHeight = Setting->bFollowHeight;
+			Follower.Z = Setting->Z;
+			Follower.Turn = Setting->Turn;
+			Follower.Name = Setting->Name;
+		}
 	}
 	if (AddedPieces.Num() > 0)
 	{
 		UE_LOG(LogLvShow, Display, TEXT("LvShow: %d set piece%s added in Openviz %s on stage"), AddedPieces.Num(), AddedPieces.Num() == 1 ? TEXT("") : TEXT("s"),
 			AddedPieces.Num() == 1 ? TEXT("is") : TEXT("are"));
+	}
+}
+
+void ULvShowSubsystem::SetMeter(const FString& How)
+{
+	UWorld* World = GetWorld();
+	if (!World || bEditing)
+	{
+		return;
+	}
+	if (!Meter.IsValid())
+	{
+		Meter = MakeShared<FLvLightMeter>();
+	}
+	const bool bOn = How == TEXT("on") || (How == TEXT("toggle") && !Meter->IsOn());
+	if (!bOn)
+	{
+		if (Meter->IsOn())
+		{
+			Meter->Stop();
+			UE_LOG(LogLvShow, Display, TEXT("LvShow: light levels off"));
+		}
+		return;
+	}
+	TArray<AActor*> NotSurfaces;
+	for (const TWeakObjectPtr<ALvSceneryActor>& Person : People)
+	{
+		if (Person.IsValid())
+		{
+			NotSurfaces.Add(Person.Get());
+		}
+	}
+	const double Started = FPlatformTime::Seconds();
+	Meter->Start(*World, StageBounds(), NotSurfaces);
+	if (Meter->IsOn())
+	{
+		UE_LOG(LogLvShow, Display, TEXT("LvShow: light levels on: %d by %d points %.0f cm apart, surfaces found in %.0f ms"), Meter->GetAcross(), Meter->GetDown(),
+			Meter->GetCell(), (FPlatformTime::Seconds() - Started) * 1000.0);
+	}
+	else
+	{
+		UE_LOG(LogLvShow, Warning, TEXT("LvShow: light levels cannot be shown: there is no stage to read, or the screen material is missing"));
+	}
+}
+
+void ULvShowSubsystem::FollowMeter()
+{
+	UWorld* World = GetWorld();
+	const bool bHad = Meter->HasReading();
+	Meter->Tick(*World, Fixtures);
+	if (!bHad && Meter->HasReading())
+	{
+		const FVector Middle = StageBounds().GetCenter();
+		UE_LOG(LogLvShow, Display, TEXT("LvShow: light levels: first reading from %d beams, highest %.0f lx, white at %.0f lx, %.0f lx below the middle of the rig; %d traces, %d of them stopped on the way"),
+			Meter->LastBeams, Meter->Highest(), Meter->ScaleTop(), Meter->ReadingAt(FVector(Middle.X, Middle.Y, 0.0)), Meter->LastTraces, Meter->LastBlocked);
+	}
+	if (Elapsed < NextMeterSay || !GEngine || IsFilming())
+	{
+		return;
+	}
+	NextMeterSay = Elapsed + 0.1;
+	// The reading under the pointer; where there is none (the mouse steering the view), in the middle of the picture.
+	APlayerController* Controller = World->GetFirstPlayerController();
+	FString Under;
+	if (Controller && Meter->HasReading())
+	{
+		float MouseX = 0.0f;
+		float MouseY = 0.0f;
+		int32 Wide = 0;
+		int32 High = 0;
+		Controller->GetViewportSize(Wide, High);
+		if (!Controller->GetMousePosition(MouseX, MouseY) || Controller->bShowMouseCursor == false)
+		{
+			MouseX = Wide * 0.5f;
+			MouseY = High * 0.5f;
+		}
+		FVector From;
+		FVector Way;
+		FHitResult Hit;
+		FCollisionQueryParams Query(SCENE_QUERY_STAT(LvLightMeterPointer), true);
+		for (const TWeakObjectPtr<ALvFixtureActor>& Fixture : Fixtures)
+		{
+			if (Fixture.IsValid())
+			{
+				Query.AddIgnoredActor(Fixture.Get());
+			}
+		}
+		if (Controller->DeprojectScreenPositionToWorld(MouseX, MouseY, From, Way) && World->LineTraceSingleByChannel(Hit, From, From + Way * 200000.0, ECC_Visibility, Query))
+		{
+			const double Lux = Meter->ReadingAt(Hit.ImpactPoint);
+			if (Lux >= 0.0)
+			{
+				Under = FString::Printf(TEXT("   |   %s: %s lx"), Controller->bShowMouseCursor ? TEXT("under the pointer") : TEXT("in the middle"),
+					*FText::AsNumber(FMath::RoundToInt64(Lux)).ToString());
+			}
+		}
+	}
+	const FString Said = !Meter->HasReading() ? FString(TEXT("Light levels: reading…"))
+		: FString::Printf(TEXT("Light levels: dark 0 to white %s lx, highest %s lx%s   |   M hides them"), *FText::AsNumber(FMath::RoundToInt64(Meter->ScaleTop())).ToString(),
+			*FText::AsNumber(FMath::RoundToInt64(Meter->Highest())).ToString(), *Under);
+	GEngine->AddOnScreenDebugMessage(0x4C78, 0.3f, FColor(235, 225, 200), Said);
+}
+
+void ULvShowSubsystem::OpenPsn(int32 Port)
+{
+	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+	if (!Sockets)
+	{
+		return;
+	}
+	// On this computer's own address: Openviz hears the tracking system on the lighting network and passes it on here.
+	FSocket* Socket = Sockets->CreateSocket(NAME_DGram, TEXT("Openviz PosiStageNet"), FNetworkProtocolTypes::IPv4);
+	TSharedRef<FInternetAddr> Here = Sockets->CreateInternetAddr(FNetworkProtocolTypes::IPv4);
+	bool bValid = false;
+	Here->SetIp(TEXT("127.0.0.1"), bValid);
+	Here->SetPort(Port);
+	if (!Socket || !Socket->SetNonBlocking(true) || !Socket->SetReuseAddr(true) || !Socket->Bind(*Here))
+	{
+		UE_LOG(LogLvShow, Warning, TEXT("LvShow: cannot listen for PosiStageNet on 127.0.0.1:%d: another program may hold the port"), Port);
+		if (Socket)
+		{
+			Sockets->DestroySocket(Socket);
+		}
+		return;
+	}
+	PsnSocket = Socket;
+	UE_LOG(LogLvShow, Display, TEXT("LvShow: listening for PosiStageNet from Openviz on 127.0.0.1:%d; %d set piece%s follow%s trackers"), Port,
+		Followers.Num(), Followers.Num() == 1 ? TEXT("") : TEXT("s"), Followers.Num() == 1 ? TEXT("s") : TEXT(""));
+}
+
+void ULvShowSubsystem::ClosePsn()
+{
+	if (PsnSocket)
+	{
+		PsnSocket->Close();
+		if (ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM))
+		{
+			Sockets->DestroySocket(PsnSocket);
+		}
+		PsnSocket = nullptr;
+	}
+}
+
+void ULvShowSubsystem::FollowTrackers()
+{
+	// Everything that has come since the last frame; only the latest place of each tracker counts.
+	uint8 Buffer[2048];
+	uint32 Pending = 0;
+	int32 Datagrams = 0;
+	while (PsnSocket->HasPendingData(Pending) && Datagrams++ < 1000)
+	{
+		int32 Read = 0;
+		if (!PsnSocket->Recv(Buffer, sizeof(Buffer), Read) || Read <= 0)
+		{
+			break;
+		}
+		const viz::PsnPacket Packet = viz::parse_psn(Buffer, static_cast<size_t>(Read));
+		for (const viz::PsnTracker& Tracker : Packet.trackers)
+		{
+			if (Packet.kind == viz::PsnPacket::Kind::Info && !Tracker.name.empty())
+			{
+				TrackerNames.Add(Tracker.id, LvToFString(Tracker.name));
+			}
+			if (Packet.kind != viz::PsnPacket::Kind::Data || !Tracker.has_position)
+			{
+				continue;
+			}
+			double Place[3];
+			viz::psn_to_mvr(Tracker.position, Place);
+			Trackers.Add(Tracker.id, FVector(Place[0], Place[1], Place[2]));
+			if (!TrackersSaid.Contains(Tracker.id))
+			{
+				TrackersSaid.Add(Tracker.id);
+				const FString* Named = TrackerNames.Find(Tracker.id);
+				UE_LOG(LogLvShow, Display, TEXT("LvShow: PosiStageNet: tracker %d%s heard at %.2f, %.2f, %.2f m"), Tracker.id,
+					Named ? *FString::Printf(TEXT(" (%s)"), **Named) : TEXT(""), Place[0] / 1000.0, Place[1] / 1000.0, Place[2] / 1000.0);
+			}
+		}
+	}
+	for (FFollower& Follower : Followers)
+	{
+		const FVector* At = Trackers.Find(Follower.Tracker);
+		if (!At || !Follower.Actor.IsValid())
+		{
+			continue;
+		}
+		// The rig file's terms, as the piece was placed: across the floor to the tracker, its own height unless it follows that too.
+		const viz::Transform Place = viz::piece_place(At->X, At->Y, Follower.bHeight ? At->Z : Follower.Z, Follower.Turn);
+		Follower.Actor->SetActorTransform(LvCoordinates::FromMvr(Place));
+		if (!Follower.bSaid)
+		{
+			Follower.bSaid = true;
+			UE_LOG(LogLvShow, Display, TEXT("LvShow: set piece '%s' follows tracker %d, now at %.2f, %.2f m"), *Follower.Name, Follower.Tracker,
+				At->X / 1000.0, At->Y / 1000.0);
+		}
 	}
 }
 
@@ -759,6 +1026,10 @@ void ULvShowSubsystem::FollowPiecesFile(UWorld& World)
 	}
 	const int32 Before = AddedPieces.Num();
 	SpawnPieces(World);
+	if (Meter.IsValid() && Meter->IsOn())
+	{
+		SetMeter(TEXT("on"));    // the surfaces may have changed
+	}
 	if (AddedPieces.Num() == 0 && Before > 0)
 	{
 		UE_LOG(LogLvShow, Display, TEXT("LvShow: the set pieces added in Openviz are gone from the stage"));
@@ -770,10 +1041,16 @@ bool ULvShowSubsystem::IsHiddenByChoice(const FString& Layer, const FString& Cla
 	return HiddenLayers.Contains(Layer) || (!Class.IsEmpty() && HiddenClasses.Contains(Class));
 }
 
+bool ULvShowSubsystem::IsFixtureHiddenByChoice(const ALvFixtureActor& Fixture) const
+{
+	return IsHiddenByChoice(Fixture.Layer, Fixture.Class) || (!Fixture.SourceUuid.IsEmpty() && HiddenFixtureIds.Contains(Fixture.SourceUuid.ToUpper()));
+}
+
 bool ULvShowSubsystem::ReadHidden()
 {
 	TSet<FString> Layers;
 	TSet<FString> Classes;
+	TSet<FString> Ids;
 	FString HiddenText;
 	if (!ShowPath.IsEmpty() && FFileHelper::LoadFileToString(HiddenText, *FPaths::ChangeExtension(ShowPath, TEXT("hidden.json"))))
 	{
@@ -795,11 +1072,21 @@ bool ULvShowSubsystem::ReadHidden()
 					Classes.Add(Name->AsString());
 				}
 			}
+			// The fixtures of groups hidden in Openviz.
+			if (Hidden->TryGetArrayField(TEXT("fixtures"), Names))
+			{
+				for (const TSharedPtr<FJsonValue>& Name : *Names)
+				{
+					Ids.Add(Name->AsString().ToUpper());
+				}
+			}
 		}
 	}
-	const bool bChanged = Layers.Num() != HiddenLayers.Num() || Classes.Num() != HiddenClasses.Num() || !Layers.Includes(HiddenLayers) || !Classes.Includes(HiddenClasses);
+	const bool bChanged = Layers.Num() != HiddenLayers.Num() || Classes.Num() != HiddenClasses.Num() || !Layers.Includes(HiddenLayers) || !Classes.Includes(HiddenClasses) ||
+		Ids.Num() != HiddenFixtureIds.Num() || !Ids.Includes(HiddenFixtureIds);
 	HiddenLayers = MoveTemp(Layers);
 	HiddenClasses = MoveTemp(Classes);
+	HiddenFixtureIds = MoveTemp(Ids);
 	return bChanged;
 }
 
@@ -875,7 +1162,7 @@ void ULvShowSubsystem::GiveLooks()
 
 void ULvShowSubsystem::ShowOrHide(ALvFixtureActor& Fixture)
 {
-	const bool bChosen = IsHiddenByChoice(Fixture.Layer, Fixture.Class);
+	const bool bChosen = IsFixtureHiddenByChoice(Fixture);
 	const bool bBehind = BehindScreens.Contains(&Fixture);
 	// A fixture without a place stands on top of every other such fixture. While watching it is
 	// left out; in the editor it is there to be picked up and placed, but dark.
@@ -1141,6 +1428,42 @@ void ULvShowSubsystem::FollowPictureFile(UWorld& World)
 		ApplyHaze();
 		Changed.Add(FString::Printf(TEXT("haze %g"), HazeSetting));
 	}
+	{
+		bool bFloor = false;
+		if (Picture->TryGetNumberField(TEXT("floor"), Number) && !FMath::IsNearlyEqual(static_cast<float>(Number), FloorRoughness, 1e-3f))
+		{
+			FloorRoughness = FMath::Clamp(static_cast<float>(Number), 0.0f, 1.0f);
+			Changed.Add(FString::Printf(TEXT("floor roughness %g"), FloorRoughness));
+			bFloor = true;
+		}
+		if (Picture->TryGetNumberField(TEXT("floor_shade"), Number) && !FMath::IsNearlyEqual(static_cast<float>(Number), FloorShade, 1e-3f))
+		{
+			FloorShade = FMath::Clamp(static_cast<float>(Number), 0.0f, 1.0f);
+			Changed.Add(FString::Printf(TEXT("floor colour %g"), FloorShade));
+			bFloor = true;
+		}
+		if (bFloor)
+		{
+			LvStage::SetFloor(World, FloorShade, FloorRoughness);
+		}
+		bool bLook = false;
+		if (Picture->TryGetNumberField(TEXT("bloom"), Number) && !FMath::IsNearlyEqual(static_cast<float>(Number), BloomNow, 1e-3f))
+		{
+			BloomNow = FMath::Clamp(static_cast<float>(Number), 0.0f, 4.0f);
+			Changed.Add(FString::Printf(TEXT("glow %g"), BloomNow));
+			bLook = true;
+		}
+		if (Picture->TryGetBoolField(TEXT("motion_blur"), bFlag) && bFlag != bMotionBlur)
+		{
+			bMotionBlur = bFlag;
+			Changed.Add(bMotionBlur ? TEXT("motion blur on") : TEXT("motion blur off"));
+			bLook = true;
+		}
+		if (bLook)
+		{
+			LvStage::SetLook(World, BloomNow, bMotionBlur);
+		}
+	}
 	if (Picture->TryGetBoolField(TEXT("rig_haze"), bFlag) && bFlag != bRigHaze)
 	{
 		bRigHaze = bFlag;
@@ -1322,6 +1645,15 @@ namespace
 			Object.TryGetNumberField(TEXT("nits"), Setting.Nits);
 			ReadPart(Object, Setting.Part);
 			const TArray<TSharedPtr<FJsonValue>>* Numbers = nullptr;
+			// "map": [ox, oy, ux, uy, vx, vy], a part that is not upright in the picture.
+			if (Object.TryGetArrayField(TEXT("map"), Numbers) && Numbers->Num() == 6)
+			{
+				Setting.bMap = true;
+				for (int32 Index = 0; Index < 6; ++Index)
+				{
+					Setting.Map[Index] = (*Numbers)[Index].IsValid() ? (*Numbers)[Index]->AsNumber() : 0.0;
+				}
+			}
 			if (Object.TryGetArrayField(TEXT("face"), Numbers) && Numbers->Num() == 12)
 			{
 				Setting.bFace = true;
@@ -1409,8 +1741,15 @@ TArray<ALvScreenActor*> ULvShowSubsystem::SpawnScreens(UWorld& World, const FStr
 
 	FLvScreenReport Report;
 	const TArray<ALvScreenActor*> Spawned = LvRig::SpawnScreens(World, MvrPath, Settings, Report);
+	ScreensPlaced.Reset();
 	for (ALvScreenActor* Screen : Spawned)
 	{
+		// A whole screen added in Openviz can be moved in the editor: where it was put is kept, to tell.
+		if (bEditing && !Screen->ScreenId.Contains(TEXT("#")) &&
+			Settings.ContainsByPredicate([Screen](const FLvScreenSetting& Setting) { return Setting.bAdded && Setting.Id == Screen->ScreenId; }))
+		{
+			ScreensPlaced.Add(Screen, Screen->GetActorTransform());
+		}
 		Screens.Add(Screen);
 		ScreensSaid.Add(FString());
 		if (IsHiddenByChoice(Screen->Layer, Screen->Class))
@@ -1505,6 +1844,90 @@ void ULvShowSubsystem::LeaveWallsToScreens(const TArray<FLvScreenSetting>& Setti
 	}
 }
 
+void ULvShowSubsystem::SaveScreenMoves()
+{
+	// What was moved, turned or scaled in the editor since it was put there, by the screen's id.
+	TMap<FString, TSharedPtr<FJsonObject>> Moved;
+	for (TPair<TWeakObjectPtr<ALvScreenActor>, FTransform>& Placed : ScreensPlaced)
+	{
+		ALvScreenActor* Screen = Placed.Key.Get();
+		if (!Screen || Screen->GetActorTransform().Equals(Placed.Value, 0.01))
+		{
+			continue;
+		}
+		const FTransform Now = Screen->GetActorTransform();
+		const FVector Right = Now.GetUnitAxis(EAxis::X);
+		const FVector Down = Now.GetUnitAxis(EAxis::Y);
+		const FVector Out = Now.GetUnitAxis(EAxis::Z);
+		const FVector At = Now.GetLocation();
+		const FVector Scale = Now.GetScale3D().GetAbs();
+		// Back into the rig file's terms: millimetres, Y mirrored, the picture's up rather than down.
+		const double Face[12] = {Right.X, -Right.Y, Right.Z, -Down.X, Down.Y, -Down.Z, Out.X, -Out.Y, Out.Z, At.X * 10.0, -At.Y * 10.0, At.Z * 10.0};
+		const double Width = Screen->Size.X * 10.0 * Scale.X;
+		const double Height = Screen->Size.Y * 10.0 * Scale.Y;
+		TSharedPtr<FJsonObject> Place = MakeShared<FJsonObject>();
+		TArray<TSharedPtr<FJsonValue>> Numbers;
+		for (const double Number : Face)
+		{
+			Numbers.Add(MakeShared<FJsonValueNumber>(FMath::RoundToDouble(Number * 1e6) / 1e6));
+		}
+		Place->SetArrayField(TEXT("face"), Numbers);
+		Place->SetNumberField(TEXT("width"), FMath::RoundToDouble(Width * 10.0) / 10.0);
+		Place->SetNumberField(TEXT("height"), FMath::RoundToDouble(Height * 10.0) / 10.0);
+		// For Openviz's page and the plot, which list a screen by the middle of its foot and its turn about the vertical.
+		Place->SetNumberField(TEXT("x"), FMath::RoundToDouble(Face[9] * 10.0) / 10.0);
+		Place->SetNumberField(TEXT("y"), FMath::RoundToDouble(Face[10] * 10.0) / 10.0);
+		Place->SetNumberField(TEXT("z"), FMath::RoundToDouble((Face[11] - Height / 2.0 * Face[5]) * 10.0) / 10.0);
+		if (FMath::Abs(Face[6]) + FMath::Abs(Face[7]) > 0.3)
+		{
+			Place->SetNumberField(TEXT("turn"), FMath::RoundToDouble(FMath::RadiansToDegrees(FMath::Atan2(Face[6], -Face[7])) * 100.0) / 100.0);
+		}
+		Moved.Add(Screen->ScreenId, Place);
+		Placed.Value = Now;
+	}
+	if (Moved.Num() == 0 || ScreensFile.IsEmpty())
+	{
+		return;
+	}
+	FString Text;
+	TSharedPtr<FJsonObject> Root;
+	const TArray<TSharedPtr<FJsonValue>>* Listed = nullptr;
+	if (!FFileHelper::LoadFileToString(Text, *ScreensFile) || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Root) || !Root.IsValid() ||
+		!Root->TryGetArrayField(TEXT("screens"), Listed))
+	{
+		return;
+	}
+	int32 Saved = 0;
+	for (const TSharedPtr<FJsonValue>& Entry : *Listed)
+	{
+		const TSharedPtr<FJsonObject>* Object = nullptr;
+		FString Id;
+		if (!Entry.IsValid() || !Entry->TryGetObject(Object) || !(*Object)->TryGetStringField(TEXT("id"), Id))
+		{
+			continue;
+		}
+		if (const TSharedPtr<FJsonObject>* Place = Moved.Find(Id))
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : (*Place)->Values)
+			{
+				(*Object)->SetField(Field.Key, Field.Value);
+			}
+			FString Name;
+			(*Object)->TryGetStringField(TEXT("name"), Name);
+			UE_LOG(LogLvShow, Display, TEXT("LvShow: screen %s moved in the editor: kept in the screens file"), *Name);
+			++Saved;
+		}
+	}
+	FString Written;
+	if (Saved == 0 || !FJsonSerializer::Serialize(Root.ToSharedRef(), TJsonWriterFactory<>::Create(&Written)) || !FFileHelper::SaveStringToFile(Written, *ScreensFile))
+	{
+		return;
+	}
+	// Ours, not Openviz's: nothing to build again.
+	ScreensStamp = IFileManager::Get().GetTimeStamp(*ScreensFile);
+	ScreensShape = ShapeOf(ReadScreenSettings(ScreensFile));
+}
+
 void ULvShowSubsystem::FollowScreensFile(UWorld& World)
 {
 	// Openviz writes the file whenever something about a screen is changed there: what was
@@ -1539,13 +1962,17 @@ void ULvShowSubsystem::FollowScreensFile(UWorld& World)
 		FString Value;
 		float Nits;
 		FVector4 Part;
+		bool bMap = false;
+		double Map[6] = {0.0, 0.0, 1.0, 0.0, 0.0, 1.0};
 	};
 	TMap<FString, FWanted> Wanted;
 	for (const FLvScreenSetting& Setting : Settings)
 	{
 		if (!Setting.IsSplit())
 		{
-			Wanted.Add(Setting.Id.ToUpper(), FWanted{Setting.Source, Setting.Value, Setting.Nits, Setting.Part});
+			FWanted& Whole = Wanted.Add(Setting.Id.ToUpper(), FWanted{Setting.Source, Setting.Value, Setting.Nits, Setting.Part});
+			Whole.bMap = Setting.bMap;
+			FMemory::Memcpy(Whole.Map, Setting.Map, sizeof(Whole.Map));
 			continue;
 		}
 		Wanted.Add(Setting.Id.ToUpper(), FWanted{TEXT("sections"), FString(), 0.0f, FVector4(0.0, 0.0, 1.0, 1.0)});
@@ -1581,6 +2008,10 @@ void ULvShowSubsystem::FollowScreensFile(UWorld& World)
 		if (!Screen->GetPart().Equals(Chosen->Part, 1e-5))
 		{
 			Screen->SetPart(Chosen->Part);
+		}
+		if (!Screen->HasMap(Chosen->bMap, Chosen->Map))
+		{
+			Screen->SetMap(Chosen->bMap, Chosen->Map);
 		}
 	}
 	LeaveWallsToScreens(Settings);
@@ -1779,6 +2210,10 @@ void ULvShowSubsystem::UpdateCamera()
 	else if (Controller->WasInputKeyJustPressed(EKeys::L))
 	{
 		PlanView(TEXT("side"));
+	}
+	if (Controller->WasInputKeyJustPressed(EKeys::M))
+	{
+		SetMeter(TEXT("toggle"));
 	}
 	if (bPlan)
 	{
@@ -2101,6 +2536,14 @@ void ULvShowSubsystem::FollowCommands()
 			Video->RequestStop();
 		}
 	}
+	else if (Command == TEXT("meter"))
+	{
+		SetMeter(Value);
+	}
+	else if (Command == TEXT("panorama"))
+	{
+		StartPanorama(Value.IsEmpty() ? 8192 : FCString::Atoi(*Value));
+	}
 	else if (Command == TEXT("picture"))
 	{
 		FString Wide;
@@ -2331,12 +2774,7 @@ void ULvShowSubsystem::TakePicture(int32 Width, int32 Height)
 	if (Width > 0 && Height > 0 && Viewport && Viewport->Viewport)
 	{
 		// Larger than the window: the engine draws the view once at that size and writes it out.
-		FHighResScreenshotConfig& Config = GetHighResScreenshotConfig();
-		Config.SetResolution(static_cast<uint32>(Width), static_cast<uint32>(Height), 1.0f);
-		Config.SetFilename(Folder / Name);
-		Config.bDateTimeBasedNaming = false;
-		Config.bMaskEnabled = false;
-		Viewport->Viewport->TakeHighResScreenShot();
+		RequestPicture(Folder / Name, Width, Height);
 		UE_LOG(LogLvShow, Display, TEXT("LvShow: picture saved as %s (%d by %d)"), *Name, Width, Height);
 		GEngine->AddOnScreenDebugMessage(0x4C78, 2.0f, FColor(170, 170, 170), FString::Printf(TEXT("Picture saved as %s (%d by %d)"), *Name, Width, Height));
 		return;
@@ -2344,6 +2782,21 @@ void ULvShowSubsystem::TakePicture(int32 Width, int32 Height)
 	FScreenshotRequest::RequestScreenshot(Folder / Name, false, false);
 	UE_LOG(LogLvShow, Display, TEXT("LvShow: picture saved as %s"), *Name);
 	GEngine->AddOnScreenDebugMessage(0x4C78, 2.0f, FColor(170, 170, 170), FString::Printf(TEXT("Picture saved as %s"), *Name));
+}
+
+void ULvShowSubsystem::RequestPicture(const FString& Path, int32 Width, int32 Height)
+{
+	UGameViewportClient* Viewport = GetWorld()->GetGameViewport();
+	if (!Viewport || !Viewport->Viewport)
+	{
+		return;
+	}
+	FHighResScreenshotConfig& Config = GetHighResScreenshotConfig();
+	Config.SetResolution(static_cast<uint32>(Width), static_cast<uint32>(Height), 1.0f);
+	Config.SetFilename(Path);
+	Config.bDateTimeBasedNaming = false;
+	Config.bMaskEnabled = false;
+	Viewport->Viewport->TakeHighResScreenShot();
 }
 
 bool ULvShowSubsystem::PlaceCamera(UWorld& World)
@@ -2421,7 +2874,7 @@ bool ULvShowSubsystem::PlaceCamera(UWorld& World)
 		ApplyMouseMode(*Controller);
 		bCameraControl = true;
 		GEngine->AddOnScreenDebugMessage(0x4C79, 12.0f, FColor(170, 170, 170),
-			TEXT("Right button: look.  Wheel: in and out.  W A S D, Q E: fly.  1 to 9: views (hold a key to store the view there).  0: start.  P: picture.  Tab: game mouse."));
+			TEXT("Right button: look.  Wheel: in and out.  W A S D, Q E: fly.  1 to 9: views (hold a key to store the view there).  0: start.  P: picture.  M: light levels.  Tab: game mouse."));
 	}
 	return true;
 }
@@ -2455,6 +2908,19 @@ void ULvShowSubsystem::Tick(float DeltaTime)
 		FollowPictureFile(*World);
 		FollowPiecesFile(*World);
 	}
+	if (PsnSocket)
+	{
+		FollowTrackers();
+	}
+	if (bMeterOnStart && bCameraPlaced && Elapsed >= 2.0)
+	{
+		bMeterOnStart = false;
+		SetMeter(TEXT("on"));
+	}
+	if (Meter.IsValid() && Meter->IsOn())
+	{
+		FollowMeter();
+	}
 	WatchFrameRate(DeltaTime);
 	if (!bScreensSettled)
 	{
@@ -2466,6 +2932,7 @@ void ULvShowSubsystem::Tick(float DeltaTime)
 		{
 			NextSave = Elapsed + 0.5;
 			SaveEdits();
+			SaveScreenMoves();
 		}
 		if (SelfTestStage >= 0 && SelfTestStage < 2 && Elapsed >= SelfTestAt)
 		{
@@ -2476,12 +2943,21 @@ void ULvShowSubsystem::Tick(float DeltaTime)
 	{
 		bCameraPlaced = PlaceCamera(*GetWorld());
 	}
+	else if (bCameraControl && RenderStage == 0 && PanoramaStep >= 0)
+	{
+		StepPanorama();    // the camera is the panorama's while it is taken
+	}
 	else if (bCameraControl && RenderStage == 0)
 	{
 		if (Elapsed >= NextCommandsLook)
 		{
 			NextCommandsLook = Elapsed + 0.15;
 			FollowCommands();
+		}
+		if (PanoramaOnStart > 0 && Elapsed >= PanoramaOnStartAt)
+		{
+			StartPanorama(PanoramaOnStart);
+			PanoramaOnStart = 0;
 		}
 		UpdateCamera();
 		if (ViewTestStage >= 0 && Elapsed >= ViewTestAt)
@@ -2575,7 +3051,121 @@ void ULvShowSubsystem::Tick(float DeltaTime)
 
 bool ULvShowSubsystem::IsFilming() const
 {
-	return (Video.IsValid() && Video->IsActive()) || RenderStage > 0;
+	return (Video.IsValid() && Video->IsActive()) || RenderStage > 0 || PanoramaStep >= 0;
+}
+
+void ULvShowSubsystem::StartPanorama(int32 Width)
+{
+	APlayerController* Controller = GetWorld()->GetFirstPlayerController();
+	if (PanoramaStep >= 0 || IsFilming() || !Controller || !Controller->PlayerCameraManager)
+	{
+		return;
+	}
+	if (bPlan)
+	{
+		UE_LOG(LogLvShow, Warning, TEXT("LvShow: panorama: not taken from a flat view: go to a view of the stage first"));
+		return;
+	}
+	PanoramaWidth = FMath::Clamp(Width, 1024, 16384);
+	// A view 90 degrees wide has as many pixels across as a quarter of the picture at its middle,
+	// and more toward its edges: a little more than a quarter keeps the picture sharp everywhere.
+	PanoramaSide = FMath::Clamp(FMath::RoundToInt(PanoramaWidth / 3.5), 256, 4096);
+	FString Folder = PicturesFolder.IsEmpty() ? FPaths::ConvertRelativePathToFull(FPaths::ScreenShotDir()) : PicturesFolder;
+	IFileManager::Get().MakeDirectory(*Folder, true);
+	PanoramaPrefix = Folder / FString::Printf(TEXT("%s %s 360 view "), ShowPath.IsEmpty() ? TEXT("Preview") : *FPaths::GetBaseFilename(ShowPath),
+		*FDateTime::Now().ToString(TEXT("%Y-%m-%d %H%M%S")));
+	PanoramaFrom = Controller->GetControlRotation();
+	bGliding = false;
+	// Motion blur would smear each view's first frames after the camera turns, and the lens's
+	// darkening toward the corners and its flares would show where the views are joined.
+	LvStage::SetLook(*GetWorld(), BloomNow, false, false);
+	Controller->PlayerCameraManager->SetFOV(90.0f);
+	PanoramaStep = 0;
+	AimPanorama();
+	UE_LOG(LogLvShow, Display, TEXT("LvShow: panorama: taking six views of %d pixels for a picture %d wide"), PanoramaSide, PanoramaWidth);
+	GEngine->AddOnScreenDebugMessage(0x4C78, 3.0f, FColor(170, 170, 170), TEXT("Taking a 360-degree picture: six views, a few seconds"));
+}
+
+void ULvShowSubsystem::AimPanorama()
+{
+	static const double Pitch[6] = {0.0, 0.0, 0.0, 0.0, 90.0, -90.0};
+	static const double Yaw[6] = {0.0, 90.0, 180.0, 270.0, 0.0, 0.0};
+	APlayerController* Controller = GetWorld()->GetFirstPlayerController();
+	if (!Controller)
+	{
+		return;
+	}
+	Controller->SetControlRotation(FRotator(Pitch[PanoramaStep], PanoramaFrom.Yaw + Yaw[PanoramaStep], 0.0));
+	if (Controller->PlayerCameraManager)
+	{
+		Controller->PlayerCameraManager->SetGameCameraCutThisFrame();    // nothing carried over from where it looked before
+	}
+	bPanoramaAsked = false;
+	PanoramaSeenSize = -1;
+	PanoramaAt = Elapsed + 0.8;    // long enough for what builds up over frames to settle
+}
+
+void ULvShowSubsystem::StepPanorama()
+{
+	const FString Path = PanoramaPrefix + FString::FromInt(PanoramaStep) + TEXT(".png");
+	if (!bPanoramaAsked)
+	{
+		if (Elapsed >= PanoramaAt)
+		{
+			RequestPicture(Path, PanoramaSide, PanoramaSide);
+			bPanoramaAsked = true;
+			PanoramaAt = Elapsed + 30.0;
+		}
+		return;
+	}
+	// Written by a worker of the engine's: taken as whole once its size has stayed put a moment.
+	const int64 Size = IFileManager::Get().FileSize(*Path);
+	if (Size > 0 && Size == PanoramaSeenSize && Elapsed - PanoramaSeenAt >= 0.25)
+	{
+		if (++PanoramaStep >= 6)
+		{
+			FinishPanorama(true);
+		}
+		else
+		{
+			AimPanorama();
+		}
+		return;
+	}
+	if (Size != PanoramaSeenSize)
+	{
+		PanoramaSeenSize = Size;
+		PanoramaSeenAt = Elapsed;
+	}
+	if (Elapsed >= PanoramaAt)
+	{
+		UE_LOG(LogLvShow, Warning, TEXT("LvShow: panorama: view %d was not saved"), PanoramaStep);
+		FinishPanorama(false);
+	}
+}
+
+void ULvShowSubsystem::FinishPanorama(bool bSaved)
+{
+	PanoramaStep = -1;
+	if (APlayerController* Controller = GetWorld()->GetFirstPlayerController())
+	{
+		Controller->SetControlRotation(PanoramaFrom);
+		if (Controller->PlayerCameraManager)
+		{
+			Controller->PlayerCameraManager->UnlockFOV();
+			Controller->PlayerCameraManager->SetGameCameraCutThisFrame();
+		}
+	}
+	LvStage::SetLook(*GetWorld(), BloomNow, bMotionBlur);
+	if (bSaved)
+	{
+		UE_LOG(LogLvShow, Display, TEXT("LvShow: panorama: views saved: %s (%d wide)"), *PanoramaPrefix, PanoramaWidth);
+		GEngine->AddOnScreenDebugMessage(0x4C78, 3.0f, FColor(170, 170, 170), TEXT("360-degree views taken: Openviz is making the picture"));
+	}
+	if (FParse::Param(FCommandLine::Get(), TEXT("LvShotQuit")) && ShotPath.IsEmpty())
+	{
+		QuitAt = Elapsed + 1.0;
+	}
 }
 
 void ULvShowSubsystem::StartVideo()
@@ -2631,6 +3221,11 @@ void ULvShowSubsystem::StepRender()
 	auto Fail = [this](const FString& Why)
 	{
 		UE_LOG(LogLvShow, Error, TEXT("LvShow: render: failed: %s"), *Why);
+		if (SizedMovie.IsValid())
+		{
+			SizedMovie.Reset();    // closes its file, which is left as its ".part": no half movie is kept
+			IFileManager::Get().Delete(*(RenderOut + TEXT(".part")), false, true, true);
+		}
 		RenderStage = 0;
 		ULvDmxSubsystem::ClearProvided();
 		FApp::SetUseFixedTimeStep(false);
@@ -2693,6 +3288,22 @@ void ULvShowSubsystem::StepRender()
 		{
 			return;
 		}
+		if (RenderSize.X > 0)
+		{
+			SizedMovie = MakeShared<viz::MovieWriter>();
+			std::string Error;
+			if (!SizedMovie->open(LvToStd(RenderOut), RenderSize.X, RenderSize.Y, RenderRate, Error))
+			{
+				Fail(LvToFString(Error));
+				return;
+			}
+			UE_LOG(LogLvShow, Display, TEXT("LvShow: video: recording to %s, %d by %d, %d frames a second"), *RenderOut, RenderSize.X, RenderSize.Y, RenderRate);
+			RenderFrame = 0;
+			SizedStep = 0;
+			RenderSaidAt = FPlatformTime::Seconds();
+			RenderStage = 3;
+			return;
+		}
 		{
 			Video = MakeShared<FLvVideo>();
 			FString Error;
@@ -2707,6 +3318,14 @@ void ULvShowSubsystem::StepRender()
 		RenderStage = 3;
 		return;
 	case 3:
+		if (SizedMovie.IsValid())
+		{
+			if (!StepSizedRender())
+			{
+				Fail(TEXT("a frame's picture could not be made into the movie"));
+			}
+			return;
+		}
 		// This frame is drawn with what was given last; the next is given now, the camera too.
 		++RenderFrame;
 		Reader->play_until(static_cast<double>(RenderFrame) / RenderRate, Give);
@@ -2737,6 +3356,108 @@ void ULvShowSubsystem::StepRender()
 	default:
 		return;
 	}
+}
+
+bool ULvShowSubsystem::StepSizedRender()
+{
+	auto Give = [](int Universe, const uint8_t* Levels, size_t Count)
+	{
+		ULvDmxSubsystem::Provide(Universe, Levels, static_cast<int32>(Count));
+	};
+	const double Seconds = static_cast<double>(RenderFrame) / RenderRate;
+	switch (SizedStep)
+	{
+	case 0:
+		// The frame's DMX and camera; the next tick moves the world on by one frame and draws it.
+		Reader->play_until(Seconds, Give);
+		PlaceRenderCamera(Seconds);
+		FApp::SetFixedDeltaTime(1.0 / RenderRate);
+		SizedStep = 1;
+		return true;
+	case 1:
+		// Drawn now: its shot is asked for, and until the shot is written the clock all but stands
+		// still, so that nothing moves on between the movie's frames.
+		SizedShot = FPaths::Combine(FPaths::GetPath(RenderOut), FPaths::GetBaseFilename(RenderOut) + TEXT(".frame.png"));
+		IFileManager::Get().Delete(*SizedShot, false, true, true);
+		RequestPicture(SizedShot, RenderSize.X, RenderSize.Y);
+		FApp::SetFixedDeltaTime(1e-5);
+		SizedSeenSize = -1;
+		SizedAskedAt = FPlatformTime::Seconds();
+		SizedStep = 2;
+		return true;
+	default:
+		break;
+	}
+	// The shot is whole once its size has stayed put for a moment.
+	const int64 Size = IFileManager::Get().FileSize(*SizedShot);
+	if (Size <= 0)
+	{
+		if (FPlatformTime::Seconds() - SizedAskedAt > 60.0)
+		{
+			UE_LOG(LogLvShow, Warning, TEXT("LvShow: render: the shot of frame %lld never came; asking again"), RenderFrame);
+			SizedStep = 1;
+		}
+		return true;
+	}
+	if (Size != SizedSeenSize)
+	{
+		SizedSeenSize = Size;
+		SizedSeenAt = FPlatformTime::Seconds();
+		return true;
+	}
+	if (FPlatformTime::Seconds() - SizedSeenAt < 0.15)
+	{
+		return true;
+	}
+	TArray<uint8> Png;
+	if (!FFileHelper::LoadFileToArray(Png, *SizedShot))
+	{
+		return false;
+	}
+	IImageWrapperModule& Images = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	TSharedPtr<IImageWrapper> Reading = Images.CreateImageWrapper(EImageFormat::PNG);
+	TArray64<uint8> Pixels;
+	if (!Reading.IsValid() || !Reading->SetCompressed(Png.GetData(), Png.Num()) || !Reading->GetRaw(ERGBFormat::BGRA, 8, Pixels))
+	{
+		return false;
+	}
+	TSharedPtr<IImageWrapper> Writing = Images.CreateImageWrapper(EImageFormat::JPEG);
+	if (!Writing.IsValid() || !Writing->SetRaw(Pixels.GetData(), Pixels.Num(), Reading->GetWidth(), Reading->GetHeight(), ERGBFormat::BGRA, 8))
+	{
+		return false;
+	}
+	const TArray64<uint8>& Jpeg = Writing->GetCompressed(92);
+	if (Reading->GetWidth() != RenderSize.X || Reading->GetHeight() != RenderSize.Y || !SizedMovie->add(Jpeg.GetData(), static_cast<size_t>(Jpeg.Num())))
+	{
+		return false;
+	}
+	IFileManager::Get().Delete(*SizedShot, false, true, true);
+	++RenderFrame;
+	if (FPlatformTime::Seconds() - RenderSaidAt >= 2.0 || RenderFrame >= RenderFrames)
+	{
+		RenderSaidAt = FPlatformTime::Seconds();
+		UE_LOG(LogLvShow, Display, TEXT("LvShow: render: frame %lld of %lld"), RenderFrame, RenderFrames);
+	}
+	if (RenderFrame < RenderFrames)
+	{
+		SizedStep = 0;
+		return true;
+	}
+	std::string Error;
+	const int32 Frames = static_cast<int32>(SizedMovie->frames());
+	const double Length = SizedMovie->seconds();
+	if (!SizedMovie->close(Error))
+	{
+		UE_LOG(LogLvShow, Warning, TEXT("LvShow: video: not saved: %s"), *LvToFString(Error));
+	}
+	else
+	{
+		UE_LOG(LogLvShow, Display, TEXT("LvShow: video: saved %s: %d frames, %.1f seconds"), *RenderOut, Frames, Length);
+	}
+	SizedMovie.Reset();
+	FApp::SetFixedDeltaTime(1.0 / RenderRate);
+	RenderStage = 4;
+	return true;
 }
 
 bool ULvShowSubsystem::ViewOf(int32 Index, FVector& OutLocation, FRotator& OutRotation) const

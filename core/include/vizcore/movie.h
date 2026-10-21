@@ -17,6 +17,18 @@
 
 namespace viz {
 
+// Sound to go with a movie: 16-bit samples, the channels interleaved (one or two).
+struct Sound {
+    int rate = 0;          // samples a second, per channel
+    int channels = 0;
+    std::vector<int16_t> samples;
+    size_t frames() const { return channels > 0 ? samples.size() / static_cast<size_t>(channels) : 0; }
+};
+
+// A WAV file's sound: PCM of 8, 16, 24 or 32 bits, or 32-bit floating point, at up to 65,535
+// samples a second; channels past the second are left out. False, with the reason, otherwise.
+VIZCORE_API bool read_wav(const std::string& path, Sound& out, std::string& error);
+
 class VIZCORE_API MovieWriter {
 public:
     MovieWriter() = default;
@@ -28,6 +40,10 @@ public:
     bool open(const std::string& path, int width, int height, int frames_per_second, std::string& error);
     // One picture, a whole JPEG file, shown for one frame. False once writing has failed.
     bool add(const uint8_t* jpeg, size_t size);
+    // Sound for the movie, written after the pictures when it is closed, as long as the movie:
+    // the movie's start is `start_seconds` into the sound (before its beginning, or past its end,
+    // there is silence). Uncompressed, as QuickTime's "sowt".
+    void set_sound(const Sound& sound, double start_seconds);
     // Writes the index and gives the file its name. False, with the reason, if that cannot be done.
     bool close(std::string& error);
 
@@ -44,7 +60,14 @@ private:
     uint64_t written_ = 0;            // bytes of pictures so far
     std::vector<uint32_t> sizes_;     // each picture's length
     std::vector<uint64_t> offsets_;   // and where in the file it starts
+    Sound sound_;                     // empty: a silent movie
+    double sound_start_ = 0.0;
 };
+
+// A movie as MovieWriter writes them, written again as `out_path` with the sound of a WAV file
+// (see set_sound). The pictures are copied as they are. False, with the reason, if that cannot be done.
+VIZCORE_API bool movie_with_sound(const std::string& movie_path, const std::string& wav_path, double start_seconds, const std::string& out_path,
+                                  std::string& error);
 
 // Reads a QuickTime file's sample table back, for tests and checks: the frame rate and size, and
 // where each picture is. False if it is not a movie as MovieWriter writes them.
@@ -55,6 +78,11 @@ struct MovieFacts {
     std::string codec;          // "jpeg"
     std::vector<uint64_t> offsets;
     std::vector<uint32_t> sizes;
+    // Its sound track, where it has one: "sowt", its rate, channels, frames and where its chunks are.
+    std::string sound_codec;
+    int sound_rate = 0, sound_channels = 0;
+    uint64_t sound_frames = 0;
+    std::vector<uint64_t> sound_offsets;
 };
 VIZCORE_API bool read_movie_facts(const std::vector<uint8_t>& file, MovieFacts& out);
 

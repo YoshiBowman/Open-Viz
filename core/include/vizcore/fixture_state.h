@@ -195,7 +195,8 @@ struct FixtureState {
     std::vector<AxisState> axes;
     std::vector<BeamState> beams;
     // How hard the fixture's fog or haze machine is working, 0-1: the most of its Fog and Haze
-    // channels. 0 for a fixture that has none.
+    // channels that set an amount, times every one that is only a switch (on or off), as MDG's
+    // ATMe has an output level and an output switch. 0 for a fixture that has none.
     double fog = 0.0;
 };
 
@@ -211,6 +212,12 @@ struct RestBeam {
     double intensity = 0.0;                     // 0-1: what the shutter and the colour leave of the flux
 };
 VIZCORE_API std::vector<RestBeam> rest_beams(const FixtureType& fixture, size_t mode_index);
+
+// Turns a fixture placed at `world` (an MVR placing, millimetres) about its own origin, by the
+// least turn that does it, so that its beams at rest point at `target` (millimetres, the same
+// space): from the middle of their lenses, along the mean of their directions. False, leaving
+// `world` alone, when there is no beam or the point is at the lens.
+VIZCORE_API bool aim_at(Transform& world, const std::vector<RestBeam>& beams, const double target[3]);
 
 // Beams that are drawn as one. A wash light's head is an array of small lenses, and its file may
 // describe every lens as a beam of its own, with its own colour and level; a strobe's panel may be
@@ -259,8 +266,10 @@ public:
 
     // `values` is what ModeEvaluator::evaluate produced for this model's evaluator.
     // An axis whose channel is currently doing something else (continuous rotation, say) keeps
-    // the target already in `out`, so pass the same FixtureState every frame.
-    void resolve(const std::vector<ChannelValue>& values, FixtureState& out) const;
+    // the target already in `out`, so pass the same FixtureState every frame. `curve` bends what
+    // each dimmer channel gives (the model is shared by every fixture of its type, the curve is
+    // the show's choice for the type).
+    void resolve(const std::vector<ChannelValue>& values, FixtureState& out, DimmerCurve curve = DimmerCurve::Linear) const;
 
 private:
     enum class Kind {
@@ -279,6 +288,7 @@ private:
         ColorRGB color;                // Additive: the emitter's colour; Subtractive: the filter's. Largest component 1
         StrobeShape shape = StrobeShape::Square;
         const Wheel* wheel = nullptr;
+        bool on_off = false;           // Fog: a switch (every channel set a fixed 0 or 1), which gates the amount rather than being one
     };
 
     struct ChannelInfo {

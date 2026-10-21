@@ -320,4 +320,76 @@ double mean_transmission(const Image& transmission) {
     return counted ? sum / static_cast<double>(counted) : 1.0;
 }
 
+std::vector<uint8_t> encode_png(const Image& picture) {
+    std::vector<uint8_t> out;
+    if (picture.width <= 0 || picture.height <= 0 || picture.rgba.size() != static_cast<size_t>(picture.width) * static_cast<size_t>(picture.height) * 4) return out;
+    size_t length = 0;
+    void* made = tdefl_write_image_to_png_file_in_memory_ex(picture.rgba.data(), picture.width, picture.height, 4, &length, 6, MZ_FALSE);
+    if (!made) return out;
+    out.assign(static_cast<const uint8_t*>(made), static_cast<const uint8_t*>(made) + length);
+    mz_free(made);
+    return out;
+}
+
+Image equirect_from_faces(const Image faces[6], int width) {
+    Image out;
+    const int side = faces[0].width;
+    if (width < 64 || width > 16384 || side < 2) return out;
+    for (int f = 0; f < 6; ++f) {
+        if (faces[f].width != side || faces[f].height != side || faces[f].rgba.size() != static_cast<size_t>(side) * static_cast<size_t>(side) * 4) return out;
+    }
+    // Each view's forward, right and up, from its pitch and yaw as Unreal's rotation matrix has them
+    // (X ahead, Y right, Z up): forward (cP cY, cP sY, sP), right (-sY, cY, 0), up (-sP cY, -sP sY, cP).
+    const double pitch[6] = {0, 0, 0, 0, 90, -90};
+    const double yaw[6] = {0, 90, 180, 270, 0, 0};
+    double forward[6][3], right[6][3], up[6][3];
+    for (int f = 0; f < 6; ++f) {
+        const double p = pitch[f] * 3.14159265358979323846 / 180.0, y = yaw[f] * 3.14159265358979323846 / 180.0;
+        const double cp = std::cos(p), sp = std::sin(p), cy = std::cos(y), sy = std::sin(y);
+        const double fwd[3] = {cp * cy, cp * sy, sp}, rgt[3] = {-sy, cy, 0.0}, upw[3] = {-sp * cy, -sp * sy, cp};
+        for (int k = 0; k < 3; ++k) {
+            forward[f][k] = std::fabs(fwd[k]) < 1e-12 ? 0.0 : fwd[k];
+            right[f][k] = std::fabs(rgt[k]) < 1e-12 ? 0.0 : rgt[k];
+            up[f][k] = std::fabs(upw[k]) < 1e-12 ? 0.0 : upw[k];
+        }
+    }
+    const int height = width / 2;
+    out.width = width;
+    out.height = height;
+    out.rgba.assign(static_cast<size_t>(width) * static_cast<size_t>(height) * 4, 255);
+    const double pi = 3.14159265358979323846;
+    for (int v = 0; v < height; ++v) {
+        const double latitude = pi * 0.5 - (v + 0.5) / height * pi;
+        for (int u = 0; u < width; ++u) {
+            const double longitude = (u + 0.5) / width * 2.0 * pi - pi;
+            const double d[3] = {std::cos(latitude) * std::cos(longitude), std::cos(latitude) * std::sin(longitude), std::sin(latitude)};
+            int best = 0;
+            double most = -2.0;
+            for (int f = 0; f < 6; ++f) {
+                const double along = d[0] * forward[f][0] + d[1] * forward[f][1] + d[2] * forward[f][2];
+                if (along > most) {
+                    most = along;
+                    best = f;
+                }
+            }
+            // Where the direction meets the view's picture: -1 to 1 across and down, then pixels.
+            const double across = (d[0] * right[best][0] + d[1] * right[best][1] + d[2] * right[best][2]) / most;
+            const double down = -(d[0] * up[best][0] + d[1] * up[best][1] + d[2] * up[best][2]) / most;
+            const double x = std::min(std::max((across + 1.0) * 0.5 * side - 0.5, 0.0), side - 1.0);
+            const double y = std::min(std::max((down + 1.0) * 0.5 * side - 0.5, 0.0), side - 1.0);
+            const int x0 = std::min(static_cast<int>(x), side - 2), y0 = std::min(static_cast<int>(y), side - 2);
+            const double fx = x - x0, fy = y - y0;
+            const uint8_t* picture = faces[best].rgba.data();
+            uint8_t* to = &out.rgba[(static_cast<size_t>(v) * static_cast<size_t>(width) + static_cast<size_t>(u)) * 4];
+            for (int c = 0; c < 4; ++c) {
+                auto at = [&](int px, int py) { return static_cast<double>(picture[(static_cast<size_t>(py) * static_cast<size_t>(side) + static_cast<size_t>(px)) * 4 + static_cast<size_t>(c)]); };
+                const double top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+                const double bottom = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+                to[c] = static_cast<uint8_t>(std::lround(std::min(std::max(top * (1.0 - fy) + bottom * fy, 0.0), 255.0)));
+            }
+        }
+    }
+    return out;
+}
+
 }  // namespace viz

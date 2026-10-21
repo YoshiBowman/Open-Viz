@@ -6,6 +6,7 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "Engine/Texture2D.h"
+#include "HAL/IConsoleManager.h"
 #include "LvCoordinates.h"
 #include "LvDmxSubsystem.h"
 #include "LvGate.h"
@@ -98,6 +99,10 @@ struct ALvFixtureActor::FRuntime
 		FVector4f Shade[5];
 		int32 ShadeNext = 0;
 		bool bShadeKnown = false;
+		// Whether something stands in the beam now, and whether its cone wears the material that
+		// shades it (M_LvBeamShadow) rather than the plain one: only while it has no gate's material.
+		bool bWantsShadow = false;
+		bool bShadowMaterial = false;
 		FApplied()
 		{
 			for (float& Place : Reach)
@@ -126,6 +131,8 @@ struct ALvFixtureActor::FRuntime
 		double IrisPhase = 0.0;
 		double IrisChance = 0.0;
 		float Roll = 0.0f;                           // how far the light is turned about its beam now
+		bool bSplit = false;                         // the look shows a colour wheel's two colours side by side
+		bool bGated = false;                         // its cone wears the gate's material
 	};
 	TArray<FGate> Gates;
 
@@ -139,6 +146,7 @@ struct ALvFixtureActor::FRuntime
 	// This frame's light of each beam before it is added up: candela, and its colour.
 	TArray<float> Candela;
 	TArray<FLinearColor> Tint;
+	TArray<FLinearColor> Clear;    // the colour without a colour wheel that stands between two slots, whose two colours the gate then shows
 
 	TArray<uint8> Override;
 	TMap<int32, TArray<uint8>> BreakOverride;     // the same for other breaks
@@ -206,6 +214,7 @@ bool ALvFixtureActor::Initialize(TSharedPtr<const FLvFixtureDefinition> InDefini
 	Runtime->OpeningAt.Init(FVector::ZeroVector, BeamCount);
 	Runtime->Candela.Init(0.0f, BeamCount);
 	Runtime->Tint.Init(FLinearColor::Black, BeamCount);
+	Runtime->Clear.Init(FLinearColor::Black, BeamCount);
 	for (int32 Beam = 0; Beam < BeamCount; ++Beam)
 	{
 		const int32 Cluster = Model->cluster_of(static_cast<size_t>(Beam));
@@ -805,7 +814,7 @@ void ALvFixtureActor::Tick(float DeltaSeconds)
 		}
 		R.Model->evaluator().evaluate(R.BreakData, R.Values);
 	}
-	R.Model->resolve(R.Values, R.State);
+	R.Model->resolve(R.Values, R.State, static_cast<viz::DimmerCurve>(TypeDimmerCurve));
 
 	// 3. Axes: the motor chases the target. Several on one geometry combine: the part is turned
 	// about its own origin, then slid along its own axes as they stand at rest. Pan and tilt turn;
@@ -878,6 +887,7 @@ void ALvFixtureActor::Tick(float DeltaSeconds)
 
 		// A colour wheel that is spinning, or held between two colours, tints the beam as it turns.
 		viz::ColorRGB Tint = Beam.color;
+		R.Clear[Index] = FLinearColor(static_cast<float>(Tint.r), static_cast<float>(Tint.g), static_cast<float>(Tint.b));
 		if (Beam.wheel)
 		{
 			R.WheelTurns[Index] = FMath::Fmod(R.WheelTurns[Index] + Beam.wheel_degrees_per_second * DeltaSeconds / 360.0, 1.0);
@@ -952,7 +962,8 @@ void ALvFixtureActor::Tick(float DeltaSeconds)
 		const double FieldAngle = FMath::Clamp(FMath::Max(Beam.field_angle, Beam.beam_angle), 1.0, 160.0);
 		const double BeamAngle = FMath::Clamp(FMath::Min(Beam.field_angle, Beam.beam_angle), 0.5, FieldAngle);
 		const float Intensity = R.Candela[Index];
-		const FLinearColor Color = R.Tint[Index];
+		FLinearColor Color = R.Tint[Index];     // the light's
+		FLinearColor ConeColor = Color;         // the beam's in haze
 		float Outer = static_cast<float>(FieldAngle * 0.5);
 		float Inner = static_cast<float>(BeamAngle * 0.5);
 
@@ -981,6 +992,19 @@ void ALvFixtureActor::Tick(float DeltaSeconds)
 				// About the beam, which is the light's own X, before the light is put where the file has it.
 				Light->SetRelativeTransform(FTransform(FQuat(FVector::XAxisVector, FMath::DegreesToRadians(RollNow))) * R.Rest[Beam.geometry]);
 				Shaping.Roll = RollNow;
+			}
+			if (bDrawn && Shaping.bSplit && R.Clear.IsValidIndex(Index))
+			{
+				// The gate shows the wheel's two colours, so the beam in haze is as without the wheel. The
+				// light on surfaces too, where the engine's light function atlas keeps colour; by default it
+				// keeps only how bright, and there the light keeps the two colours mixed and the pattern
+				// says how bright each side is.
+				static const IConsoleVariable* AtlasFormat = IConsoleManager::Get().FindConsoleVariable(TEXT("r.LightFunctionAtlas.Format"));
+				ConeColor = R.Clear[Index];
+				if (AtlasFormat && AtlasFormat->GetInt() == 1)
+				{
+					Color = R.Clear[Index];
+				}
 			}
 			if (bDrawn)
 			{
@@ -1146,6 +1170,24 @@ void ALvFixtureActor::Tick(float DeltaSeconds)
 		}
 		++LitBeams;
 		ShadedBeams += bShade ? 1 : 0;
+		// The plain beam material has no shadow path, which makes it the cheaper: a cone wears the
+		// one that has only while something stands in it. A gate's material has its own.
+		Applied.bWantsShadow = bShade;
+		const bool bGated = R.Gates.IsValidIndex(Index) && R.Gates[Index].bGated;
+		if (!bGated && Applied.bShadowMaterial != bShade)
+		{
+			UMaterialInterface* Shadow = nullptr;
+			if (bShade)
+			{
+				ULvFixtureLibrary* Library = ULvFixtureLibrary::Get();
+				Shadow = Library ? Library->GetShadowBeam() : nullptr;
+			}
+			if (!bShade || Shadow)
+			{
+				Cone->SetMaterial(0, Shadow);    // none: the plain beam the cone's mesh carries
+				Applied.bShadowMaterial = bShade;
+			}
+		}
 		const float Radius = static_cast<float>(Length * TanHalf);
 		if (FMath::Abs(Applied.ConeLength - Length) > 0.5f || FMath::Abs(Applied.ConeRadius - Radius) > 0.05f)
 		{
@@ -1170,7 +1212,7 @@ void ALvFixtureActor::Tick(float DeltaSeconds)
 				Applied.Shade[Group] = Told;
 			}
 		}
-		const FVector4f LightData(Color.R, Color.G, Color.B, Intensity);
+		const FVector4f LightData(ConeColor.R, ConeColor.G, ConeColor.B, Intensity);
 		if (!Applied.ConeLight.Equals(LightData, 1e-4f))
 		{
 			Cone->SetCustomPrimitiveDataVector4(0, FVector4(LightData));
@@ -1237,9 +1279,23 @@ bool ALvFixtureActor::ApplyGate(int32 Beam, int32 Handle, UMaterialInterface* Li
 			Light->SetLightFunctionMaterial(LightFunction);
 		}
 	}
+	Shaping.bGated = BeamMaterial != nullptr;
 	if (UStaticMeshComponent* Cone = BeamCones.IsValidIndex(Beam) ? BeamCones[Beam].Get() : nullptr)
 	{
-		Cone->SetMaterial(0, BeamMaterial);    // none: back to the plain beam the cone's mesh carries
+		// None: back to the plain beam the cone's mesh carries, or the one that shades it if something stands in it.
+		UMaterialInterface* Wear = BeamMaterial;
+		bool bShadowMaterial = false;
+		if (!Wear && Runtime->Applied.IsValidIndex(Beam) && Runtime->Applied[Beam].bWantsShadow)
+		{
+			ULvFixtureLibrary* Library = ULvFixtureLibrary::Get();
+			Wear = Library ? Library->GetShadowBeam() : nullptr;
+			bShadowMaterial = Wear != nullptr;
+		}
+		Cone->SetMaterial(0, Wear);
+		if (Runtime->Applied.IsValidIndex(Beam))
+		{
+			Runtime->Applied[Beam].bShadowMaterial = bShadowMaterial;
+		}
 	}
 	return true;
 }
@@ -1292,7 +1348,7 @@ bool ALvFixtureActor::BuildGateLook(int32 Index, float DeltaSeconds, double Fiel
 		double Lateral = 0.0;    // how far it sits off the beam's centre, in beam radii: shaking, or passing through
 		double Radius = 0.35;    // an animation wheel: the beam's size on the wheel, the wheel's own radius being 1
 	};
-	FLayer Layers[viz::kGateLayers];
+	FLayer Layers[viz::kGateLayers + 1];    // the wheels' pictures, then a colour wheel's two colours
 	for (int32 L = 0; L < viz::kGateLayers; ++L)
 	{
 		const viz::GateLayer& In = Beam.layers[L];
@@ -1339,14 +1395,25 @@ bool ALvFixtureActor::BuildGateLook(int32 Index, float DeltaSeconds, double Fiel
 
 	const viz::PrismState* Prism = nullptr;
 	double PrismAngle = 0.0;
+	const viz::PrismState* Second = nullptr;    // a second prism in at the same time: copies of the first's copies
+	double SecondAngle = 0.0;
 	for (int32 P = 0; P < viz::kPrisms; ++P)
 	{
 		const viz::PrismState& In = Beam.prisms[P];
 		Shaping.PrismSpin[P] = In.degrees_per_second != 0.0 ? FMath::Fmod(Shaping.PrismSpin[P] + In.degrees_per_second * DeltaSeconds, 360.0) : 0.0;
-		if (!Prism && In.slot)
+		if (!In.slot)
 		{
-			Prism = &In;    // one prism at a time is drawn: the first that is in
+			continue;
+		}
+		if (!Prism)
+		{
+			Prism = &In;
 			PrismAngle = In.degrees + Shaping.PrismSpin[P];
+		}
+		else if (!Second)
+		{
+			Second = &In;
+			SecondAngle = In.degrees + Shaping.PrismSpin[P];
 		}
 	}
 
@@ -1386,6 +1453,40 @@ bool ALvFixtureActor::BuildGateLook(int32 Index, float DeltaSeconds, double Fiel
 		if (Layers[L].Picture)
 		{
 			Active[ActiveCount++] = L;
+		}
+	}
+
+	// A colour wheel standing between two slots, or turning, shows both colours side by side, the line
+	// between them crossing the beam as the wheel turns: the "split colour" a fixture's wheel gives.
+	// Slots move across the beam from its right; neighbouring ones sit 2.4 beam radii apart, as gobos do.
+	Shaping.bSplit = false;
+	const int32 SplitLayer = viz::kGateLayers;
+	if (Beam.wheel && Beam.wheel->slots.size() >= 2 && ActiveCount < 2 && Library && R.Model->cluster_of(static_cast<size_t>(Index)) < 0 &&
+		R.WheelTurns.IsValidIndex(Index))
+	{
+		const viz::Wheel& Wheel = *Beam.wheel;
+		const double Turns = Beam.wheel_degrees / 360.0 + R.WheelTurns[Index];
+		const viz::WheelPlace Place = viz::wheel_place_at(Wheel, Turns);
+		const double Edge = Place.offset >= 0.0 ? (0.5 - Place.offset) * 2.4 : -(0.5 + Place.offset) * 2.4;
+		if (FMath::Abs(Edge) < 1.0)
+		{
+			const int32 Count = static_cast<int32>(Wheel.slots.size());
+			const int32 Left = Place.offset >= 0.0 ? Place.slot : (Place.slot + Count - 2) % Count + 1;
+			const int32 Right = Place.offset >= 0.0 ? Place.slot % Count + 1 : Place.slot;
+			// Each colour as the beam has it with that slot in the middle.
+			auto SlotColour = [&Wheel, Count](int32 Slot)
+			{
+				const viz::ColorRGB Glass = viz::wheel_color_at(Wheel, static_cast<double>(Slot - 1) / Count);
+				return FLinearColor(static_cast<float>(Glass.r), static_cast<float>(Glass.g), static_cast<float>(Glass.b));
+			};
+			Layers[SplitLayer].Picture = Library->GetSplitColours(SlotColour(Left), SlotColour(Right));
+			Layers[SplitLayer].Angle = 0.0;
+			Layers[SplitLayer].Lateral = Edge;
+			if (Layers[SplitLayer].Picture)
+			{
+				Active[ActiveCount++] = SplitLayer;
+				Shaping.bSplit = true;
+			}
 		}
 	}
 	if (ActiveCount == 0 && !Prism && !bIris && !bBlades && Blur < 0.002)
@@ -1438,7 +1539,30 @@ bool ALvFixtureActor::BuildGateLook(int32 Index, float DeltaSeconds, double Fiel
 	const double Widen = FMath::RoundToDouble((1.0 + 0.6 * Beam.frost) * 64.0) / 64.0;
 	double Spread = Widen;
 	int32 Facets = 0;
-	if (Prism)
+	if (Prism && Second)
+	{
+		// Two prisms: each copy of the first is copied again by the second, each prism turned by its own
+		// angle. Their places are worked out here, turned as they stand, and the materials told not to turn them.
+		const std::vector<viz::PrismImage> First = viz::prism_images(*Prism->slot);
+		const std::vector<viz::PrismImage> Then = viz::prism_images(*Second->slot);
+		const double A = Quarter(PrismAngle - OutRoll), B = Quarter(SecondAngle - OutRoll);
+		const int32 Total = static_cast<int32>(First.size() * Then.size());
+		const int32 Step = FMath::Max(1, FMath::DivideAndRoundUp(Total, 16));
+		double Reach = 1.0;
+		for (int32 Image = 0; Image < Total && Facets < 16; Image += Step)
+		{
+			const viz::PrismImage& One = First[static_cast<size_t>(Image) / Then.size()];
+			const viz::PrismImage& Two = Then[static_cast<size_t>(Image) % Then.size()];
+			const double X = FMath::Cos(A) * One.x - FMath::Sin(A) * One.y + FMath::Cos(B) * Two.x - FMath::Sin(B) * Two.y;
+			const double Y = FMath::Sin(A) * One.x + FMath::Cos(A) * One.y + FMath::Sin(B) * Two.x + FMath::Cos(B) * Two.y;
+			const double ScaleX = One.scale_x * Two.scale_x, ScaleY = One.scale_y * Two.scale_y;
+			Look.Set(FLvGateLook::Facet0 + Facets++, FMath::RoundToDouble(X * 64.0) / 64.0, FMath::RoundToDouble(Y * 64.0) / 64.0, 1.0 / ScaleX, 1.0 / ScaleY);
+			Reach = FMath::Max(Reach, FMath::Sqrt(X * X + Y * Y) + FMath::Max(ScaleX, ScaleY) * Widen);
+		}
+		Spread = Reach;
+		Look.Set(FLvGateLook::Turn, 1.0, 0.0, 0.0, 0.0);
+	}
+	else if (Prism)
 	{
 		const std::vector<viz::PrismImage> Images = viz::prism_images(*Prism->slot);
 		// The materials take sixteen copies; of a prism with more, evenly chosen ones are drawn.

@@ -52,4 +52,17 @@ VIZCORE_API Image gobo_transmission(const Image& picture);
 // passes through and over the three colours, in linear light.
 VIZCORE_API double mean_transmission(const Image& transmission);
 
+// A picture as a PNG file (8 bits of red, green, blue and alpha). Empty if it cannot be made.
+VIZCORE_API std::vector<uint8_t> encode_png(const Image& picture);
+
+// A 360-degree picture from the six square views a camera takes with a lens 90 degrees wide,
+// in this order: ahead, right, behind, left, up and down. Ahead, right, behind and left are
+// level, each turned a quarter further to the right; up and down are turned from ahead, so
+// that the top of the view looking up is behind and the top of the view looking down is ahead
+// (as Unreal's camera turns: pitch then yaw, no roll). What comes out is equirectangular,
+// `width` by width / 2: ahead in the middle, behind at both edges, right to the right, straight
+// up along the top. Each pixel is taken from the view that sees it most squarely, between its
+// four nearest pixels. Empty if the six are not squares of one size, or `width` is not 64 to 16384.
+VIZCORE_API Image equirect_from_faces(const Image faces[6], int width);
+
 }  // namespace viz

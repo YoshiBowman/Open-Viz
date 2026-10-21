@@ -74,6 +74,12 @@ public:
 	UStaticMesh* GetBeamCone();
 
 	/**
+	 * The beam material for a cone with something standing in its beam (M_LvBeamShadow). The cone's
+	 * mesh carries M_LvBeam, which has no shadow path and is the cheaper for it. Null if not in this build.
+	 */
+	UMaterialInterface* GetShadowBeam();
+
+	/**
 	 * A glowing surface 1 cm across facing +X, round or square, with the emissive material on it:
 	 * a lens, an LED cell. Null if the material is not in this build.
 	 */
@@ -99,6 +105,13 @@ public:
 	/** A wheel's empty slot as a picture: a clear hole in the dark wheel. For a wheel that is turning. */
 	UTexture2D* GetOpenHole();
 
+	/**
+	 * Two colours side by side, the first on the picture's left half and the second on its right,
+	 * with a soft line between: a colour wheel standing between two of its slots. Linear colours,
+	 * the largest part of each 1. Shared by every fixture that splits those two colours.
+	 */
+	UTexture2D* GetSplitColours(const FLinearColor& Left, const FLinearColor& Right);
+
 private:
 	TMap<FString, TSharedPtr<const FLvFixtureDefinition>> Loaded;
 
@@ -112,6 +125,10 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UTexture2D> OpenHole;
+
+	/** By the two colours, rounded. */
+	UPROPERTY(Transient)
+	TMap<FString, TObjectPtr<UTexture2D>> SplitColours;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> SceneryMaterial;
@@ -138,6 +155,11 @@ private:
 	TObjectPtr<UStaticMesh> BeamCone;
 
 	bool bBeamConeTried = false;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInterface> ShadowBeam;
+
+	bool bShadowBeamTried = false;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UStaticMesh> GlowDisc;

@@ -264,16 +264,37 @@ def choose_file_command(kind):
     """The command that has the user pick a picture or a film in the system's own file window and
     prints its path, or None where there is no such window to ask."""
     if MAC:
-        kinds = '{"public.image"}' if kind == "picture" else '{"glb", "obj", "3ds"}' if kind == "model" else '{"public.movie"}'
-        prompt = "Choose a model for the show" if kind == "model" else f"Choose a {kind} for the screen"
+        kinds = '{"public.image"}' if kind == "picture" else '{"glb", "obj", "3ds"}' if kind == "model" else '{"public.audio"}' if kind == "sound" else '{"public.movie"}'
+        prompt = "Choose a model for the show" if kind == "model" else "Choose the sound for the video" if kind == "sound" else f"Choose a {kind} for the screen"
         return ["osascript", "-e", f'POSIX path of (choose file with prompt "{prompt}" of type {kinds})']
     if WINDOWS:
-        endings = "*.png;*.jpg;*.jpeg;*.bmp;*.tga" if kind == "picture" else "*.glb;*.obj;*.3ds" if kind == "model" else "*.mp4;*.mov;*.m4v;*.avi;*.wmv"
-        title = "Choose a model for the show" if kind == "model" else f"Choose a {kind} for the screen"
+        endings = ("*.png;*.jpg;*.jpeg;*.bmp;*.tga" if kind == "picture" else "*.glb;*.obj;*.3ds" if kind == "model" else
+                   "*.wav;*.mp3;*.m4a;*.aif;*.aiff;*.flac" if kind == "sound" else "*.mp4;*.mov;*.m4v;*.avi;*.wmv")
+        title = "Choose a model for the show" if kind == "model" else "Choose the sound for the video" if kind == "sound" else f"Choose a {kind} for the screen"
         script = ("Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; "
                   f"$d.Title = '{title}'; $d.Filter = '{kind.capitalize()}s|{endings}|All files|*.*'; "
                   "if ($d.ShowDialog() -eq 'OK') { [Console]::Out.Write($d.FileName) } else { exit 3 }")
         return ["powershell", "-NoProfile", "-STA", "-Command", script]
+    return None
+
+
+def sound_converter(source, target, ffmpeg=None):
+    """The command that makes a sound file (MP3, AAC, AIFF, FLAC, WAV...) a WAV of 16-bit samples at
+    48 kHz, as a rendered video's sound is put in, or None where the system has nothing for it (then
+    only WAV files can be used). macOS has afconvert; elsewhere FFmpeg, if it is installed."""
+    if MAC and os.path.exists("/usr/bin/afconvert"):
+        return ["/usr/bin/afconvert", "-f", "WAVE", "-d", "LEI16@48000", source, target]
+    ffmpeg = ffmpeg or shutil.which("ffmpeg")
+    if ffmpeg:
+        return [ffmpeg, "-y", "-loglevel", "error", "-i", source, "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", target]
+    return None
+
+
+def jpeg_converter(source, target):
+    """The command that makes a JPEG of a PNG, or None where the system has nothing for it (then the
+    PNG is kept). macOS has sips."""
+    if MAC and os.path.exists("/usr/bin/sips"):
+        return ["/usr/bin/sips", "-s", "format", "jpeg", "-s", "formatOptions", "92", source, "--out", target]
     return None
 
 

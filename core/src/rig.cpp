@@ -166,6 +166,22 @@ void TypeSwaps::correct(std::string_view gdtf_spec, bool invert_pan, bool invert
     if (swap.corrects()) swaps.push_back(std::move(swap));
 }
 
+void TypeSwaps::set_dimmer_curve(std::string_view gdtf_spec, DimmerCurve curve) {
+    const std::string key = type_key(gdtf_spec);
+    if (key.empty()) return;
+    for (size_t index = 0; index < swaps.size(); ++index) {
+        TypeSwap& have = swaps[index];
+        if (type_key(have.type) != key) continue;
+        have.dimmer = curve;
+        if (!have.stands_in() && !have.corrects()) swaps.erase(swaps.begin() + static_cast<std::ptrdiff_t>(index));
+        return;
+    }
+    TypeSwap swap;
+    swap.type = std::string(gdtf_spec);
+    swap.dimmer = curve;
+    if (swap.corrects()) swaps.push_back(std::move(swap));
+}
+
 void TypeSwaps::set(TypeSwap swap) {
     const std::string key = type_key(swap.type);
     for (TypeSwap& have : swaps) {
@@ -208,6 +224,7 @@ TypeSwaps parse_type_swaps(std::string_view xml) {
         double degrees = 0.0;
         if (text::parse_double(node.attribute("PanOffset").value(), degrees) && degrees > -360.0 && degrees < 360.0) swap.pan_offset = degrees;
         if (text::parse_double(node.attribute("TiltOffset").value(), degrees) && degrees > -360.0 && degrees < 360.0) swap.tilt_offset = degrees;
+        parse_dimmer_curve(text::trim(node.attribute("DimmerCurve").value()), swap.dimmer);    // one not known: as the file has it
         if (!swap.stands_in() && !swap.corrects()) continue;
         result.swaps.push_back(std::move(swap));
     }
@@ -232,6 +249,7 @@ std::string write_type_swaps(const TypeSwaps& swaps) {
         if (swap.invert_tilt) out += " TiltInvert=\"true\"";
         if (swap.pan_offset != 0.0) out += " PanOffset=\"" + degrees(swap.pan_offset) + "\"";
         if (swap.tilt_offset != 0.0) out += " TiltOffset=\"" + degrees(swap.tilt_offset) + "\"";
+        if (swap.dimmer != DimmerCurve::Linear) out += std::string(" DimmerCurve=\"") + dimmer_curve_name(swap.dimmer) + "\"";
         if (swap.modes.empty() || !swap.stands_in()) {
             out += "/>\n";
             continue;
@@ -465,6 +483,7 @@ std::vector<RigFixture> merge_rig(const MvrScene& scene, const ShowEdits& edits,
             fixture.invert_tilt = fixture.invert_tilt != entry->invert_tilt;
             fixture.pan_offset = entry->pan_offset;
             fixture.tilt_offset = entry->tilt_offset;
+            fixture.dimmer = entry->dimmer;
         }
         rig.push_back(std::move(fixture));
     }
@@ -491,6 +510,7 @@ std::vector<RigFixture> merge_rig(const MvrScene& scene, const ShowEdits& edits,
             fixture.invert_tilt = fixture.invert_tilt != correction->invert_tilt;
             fixture.pan_offset = correction->pan_offset;
             fixture.tilt_offset = correction->tilt_offset;
+            fixture.dimmer = correction->dimmer;
         }
         rig.push_back(std::move(fixture));
     }

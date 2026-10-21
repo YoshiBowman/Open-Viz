@@ -17,8 +17,13 @@
 //   vizcore_inspect --remove rig.mvr uuid[,uuid...]   take fixtures out of the rig (in its edits; the MVR is not touched)
 //   vizcore_inspect --restore rig.mvr uuid[,uuid...]  put removed fixtures back
 //   vizcore_inspect --remove-type rig.mvr <type>      every fixture of that type out of the rig; --restore-type puts them back
-//   vizcore_inspect --set rig.mvr library uuid[,uuid...] key=value ...   change fixtures' place, patch, mode, name, number or inversion (in the edits)
+//   vizcore_inspect --set rig.mvr library uuid[,uuid...] key=value ...   change fixtures' place, aim, patch, mode, name, number or inversion (in the edits)
+//   vizcore_inspect --state fixture.gdtf <mode> [slot=level ...]   what the fixture's pan, tilt and beams do with that DMX
+//   vizcore_inspect --movie-sound in.mov sound.wav <start seconds> out.mov   a movie of the visualizer's again, with sound
+//   vizcore_inspect --panorama <prefix> out.png <width>   six views (<prefix>0.png to 5.png) made into a 360-degree picture
 //   vizcore_inspect --correct rig.mvr <type> <pan 0|1> <tilt 0|1> <pan offset> <tilt offset>   which way a type's pan and tilt run, and from where
+//   vizcore_inspect --dimmer-curve rig.mvr <type> <linear|square|inverse-square|s-curve>   how a type's dimmer level becomes light in the show
+//   vizcore_inspect --psn packet.bin   a PosiStageNet datagram as the core reads it: its kind, then a line per tracker
 // "library" is the folder of GDTF files that added fixtures take their types from; --patch takes it as a last argument too.
 #include <algorithm>
 #include <cmath>
@@ -42,6 +47,7 @@
 #include "vizcore/movie.h"
 #include "vizcore/mvr_export.h"
 #include "vizcore/pieces.h"
+#include "vizcore/psn.h"
 #include "vizcore/rig.h"
 #include "vizcore/screens.h"
 #include "vizcore/show_edits.h"
@@ -379,6 +385,8 @@ bool mode_has(const FixtureType& type, size_t mode_index, const char* attribute)
     return false;
 }
 
+// --patch also gives the rig file's focus points, "focuspoint <uuid> <name> <x> <y> <z>" (millimetres),
+// first; and after a fixture's own lines, "focus <uuid> <focus point uuid>" where the file aims it at one.
 int patch(const std::string& path, const std::string& library_dir) {
     Archive archive;
     std::string error;
@@ -390,6 +398,11 @@ int patch(const std::string& path, const std::string& library_dir) {
     if (!result.ok) {
         std::printf("error\tits scene description cannot be read\n");
         return 1;
+    }
+    for (const MvrObject& object : result.scene.objects) {
+        if (object.kind != MvrObjectKind::FocusPoint) continue;
+        std::printf("focuspoint\t%s\t%s\t%.3f\t%.3f\t%.3f\n", field(object.uuid).c_str(), field(object.name).c_str(), object.world.o[0], object.world.o[1],
+                    object.world.o[2]);
     }
     std::map<std::string, GdtfResult> types;    // by archive entry, or "library|<file>" for an added fixture's or a stand-in
     std::map<std::string, std::string> mode_lengths;    // by the same: the type's modes and their slots, as written out
@@ -498,6 +511,7 @@ int patch(const std::string& path, const std::string& library_dir) {
         std::printf("place\t%s\t%.3f\t%.3f\t%.3f\t%.4f\t%.4f\t%.4f\t%d\t%d\t%d\t%d\n", field(fixture.uuid).c_str(), fixture.world.o[0], fixture.world.o[1],
                     fixture.world.o[2], turn[0], turn[1], turn[2], fixture.own_invert_pan ? 1 : 0, fixture.own_invert_tilt ? 1 : 0, has_pan ? 1 : 0, has_tilt ? 1 : 0);
         if (!modes_line.empty()) std::printf("modes\t%s%s\n", field(fixture.uuid).c_str(), modes_line.c_str());
+        if (fixture.source && !fixture.source->focus.empty()) std::printf("focus\t%s\t%s\n", field(fixture.uuid).c_str(), field(fixture.source->focus).c_str());
     }
     return 0;
 }
@@ -521,6 +535,8 @@ const char* beam_type_name(BeamType type) {
 //
 //   type <number> <min x y z> <max x y z>      the box a fixture type fills at rest, about its own origin;
 //                                              all zero if its file gives no sizes
+//   points <number> <x y z> ...                the points that outline it from above, the front and the side
+//                                              (fixture_outline_points), where its file gives sizes
 //   place <uuid> <type number> <placing>       a fixture that will be on stage (-1: its type is unknown)
 //   beam <uuid> <n> <origin x y z> <direction x y z> <lumens> <beam angle> <field angle> <intensity> <kind>
 //                                              one of its beams at rest, dimmers full: where the light leaves and which way
@@ -590,6 +606,13 @@ int plot(const std::string& path, const std::string& library_dir) {
                     const Bounds bounds = fixture_bounds(loaded.type.fixture, geometry, &loaded.archive);
                     std::printf("type\t%d\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n", numbered->second, bounds.min[0] * 1000.0, bounds.min[1] * 1000.0,
                                 bounds.min[2] * 1000.0, bounds.max[0] * 1000.0, bounds.max[1] * 1000.0, bounds.max[2] * 1000.0);
+                    // Its outline, to draw it as it looks rather than as its box.
+                    const std::vector<std::array<double, 3>> outline = fixture_outline_points(loaded.type.fixture, geometry, &loaded.archive);
+                    if (!outline.empty()) {
+                        std::printf("points\t%d", numbered->second);
+                        for (const auto& point : outline) std::printf("\t%.1f\t%.1f\t%.1f", point[0] * 1000.0, point[1] * 1000.0, point[2] * 1000.0);
+                        std::printf("\n");
+                    }
                 }
                 number = numbered->second;
                 // Its beams at rest, in the rig's world: the fixture's placing is millimetres and may carry a scale.
@@ -641,7 +664,9 @@ int plot(const std::string& path, const std::string& library_dir) {
     }
     // The set pieces added in the application, as objects of a layer of their own.
     for (const PlacedPiece& placed : read_pieces(path, library_dir)) {
-        std::printf("object\t%s\tpiece:%s\t%s\tAdded in Openviz\t\n", placed.piece.kind == "truss" ? "Truss" : "SceneObject", field(placed.id).c_str(),
+        const std::string& kind = placed.piece.kind;
+        const bool rigging = kind == "truss" || kind == "circle" || kind == "corner" || kind == "triangle" || kind == "pipe" || kind == "boom";
+        std::printf("object\t%s\tpiece:%s\t%s\tAdded in Openviz\t\n", rigging ? "Truss" : "SceneObject", field(placed.id).c_str(),
                     field(placed.name.empty() ? placed.piece.kind : placed.name).c_str());
         const Mesh shape = placed_piece_mesh(placed);
         if (shape.triangle_count() == 0) continue;    // a model that cannot be read has no box
@@ -1065,6 +1090,7 @@ int types_of(const std::string& path, const std::string& library_dir) {
         if (taken_out.count(spec)) std::printf("removed\t%s\t%zu\n", field(spec).c_str(), taken_out[spec]);
         std::printf("moves\t%s\t%d\t%d\t%.6g\t%.6g\t%d\t%d\n", field(spec).c_str(), reading && reading->invert_pan ? 1 : 0, reading && reading->invert_tilt ? 1 : 0,
                     reading ? reading->pan_offset : 0.0, reading ? reading->tilt_offset : 0.0, has_pan ? 1 : 0, has_tilt ? 1 : 0);
+        std::printf("curve\t%s\t%s\n", field(spec).c_str(), dimmer_curve_name(reading ? reading->dimmer : DimmerCurve::Linear));
     }
     return 0;
 }
@@ -1197,6 +1223,35 @@ int correct(const std::string& path, const std::string& spec, const std::string&
     return 0;
 }
 
+// How a type's dimmer level becomes light in this show: "linear" (as the file has it), "square",
+// "inverse-square" or "s-curve". Kept in the types file beside the show, as the pan and tilt corrections are.
+int set_curve(const std::string& path, const std::string& spec, const std::string& name) {
+    const MvrResult result = load_mvr_file(path);
+    if (!result.ok) {
+        std::printf("error\tits scene description cannot be read\n");
+        return 1;
+    }
+    bool known = false;
+    for (const MvrFixture& fixture : result.scene.fixtures) known = known || same_type(fixture.gdtf_spec, spec);
+    if (!known) {
+        std::printf("error\tthe show has no fixture type %s\n", field(spec).c_str());
+        return 1;
+    }
+    DimmerCurve curve = DimmerCurve::Linear;
+    if (!parse_dimmer_curve(name, curve)) {
+        std::printf("error\ta dimmer curve is linear, square, inverse-square or s-curve\n");
+        return 1;
+    }
+    TypeSwaps swaps = read_swaps(path);
+    swaps.set_dimmer_curve(spec, curve);
+    if (!write_swaps(path, swaps)) {
+        std::printf("error\tit could not be written beside the show\n");
+        return 1;
+    }
+    std::printf("curve\t%s\t%s\n", field(spec).c_str(), dimmer_curve_name(curve));
+    return 0;
+}
+
 // Changes fixtures of a show: where they stand, how they are turned, their patch, mode, name,
 // number and whether their pan and tilt are mirrored. Everything goes into the show's edits; the
 // rig file is not touched. `uuids` are separated by commas and taken in that order.
@@ -1206,6 +1261,8 @@ int correct(const std::string& path, const std::string& spec, const std::string&
 //   stepx= stepy= stepz=  each fixture after the first that much further on than the one before (a row)
 //   rx= ry= rz=         its turn about the world's X, Y and Z axes, degrees (see turn_angles)
 //   spin=               or: turned by that many degrees about its own vertical axis
+//   aimx= aimy= aimz=   or: turned where it hangs, by the least turn, so that its beam at rest points
+//                       at that point (millimetres). Not a fixture that pans or tilts: the console aims those
 //   universe= address=  its patch (break 1); several fixtures follow one another, each as long as its mode;
 //                       universe=0 unpatches
 //   mode=               a mode of the fixture type in force
@@ -1217,7 +1274,9 @@ int correct(const std::string& path, const std::string& spec, const std::string&
 //                       file's type again. Not together with a patch: the patch goes by the mode's length
 //   reset=              place, patch, mode, name, invert, type or all: back to what the rig file says
 //
-// Answers "set <uuid>" for every fixture, or one "error" line and nothing changed.
+// Answers "set <uuid>" for every fixture, or one "error" line and nothing changed. Aiming adds
+// "aimed <uuid>" for each fixture turned, and "notaimed <uuid> <why>" for each that was not: it
+// moves (pans or tilts), unplaced (has no place to aim from), nobeam, unreadable (its type).
 int set_fixtures(const std::string& path, const std::string& library_dir, const std::string& uuids, const std::vector<std::string>& settings) {
     Archive archive;
     std::string error;
@@ -1239,8 +1298,8 @@ int set_fixtures(const std::string& path, const std::string& library_dir, const 
         }
         wanted[setting.substr(0, equals)] = setting.substr(equals + 1);
     }
-    static const char* const known[] = {"x", "y", "z", "dx", "dy", "dz", "stepx", "stepy", "stepz", "rx", "ry", "rz", "spin", "universe", "address", "mode",
-                                        "name", "number", "id", "invertpan", "inverttilt", "type", "reset"};
+    static const char* const known[] = {"x", "y", "z", "dx", "dy", "dz", "stepx", "stepy", "stepz", "rx", "ry", "rz", "spin", "aimx", "aimy", "aimz", "universe",
+                                        "address", "mode", "name", "number", "id", "invertpan", "inverttilt", "type", "reset"};
     for (const auto& [key, value] : wanted) {
         bool found = false;
         for (const char* name : known) found = found || key == name;
@@ -1320,6 +1379,19 @@ int set_fixtures(const std::string& path, const std::string& library_dir, const 
         if (has(turn_keys[k])) turn[k] = real(turn_keys[k], -360.0, 360.0);
     }
     const double spin = has("spin") ? real("spin", -360.0, 360.0) : 0.0;
+    // Aimed at a point: turned where it hangs so that its beam at rest points there.
+    const bool aiming = has("aimx") || has("aimy") || has("aimz");
+    if (aiming && !(has("aimx") && has("aimy") && has("aimz"))) {
+        std::printf("error\taim at a point takes aimx, aimy and aimz together\n");
+        return 1;
+    }
+    double aim[3] = {0, 0, 0};
+    if (aiming) {
+        aim[0] = real("aimx", -limit, limit);
+        aim[1] = real("aimy", -limit, limit);
+        aim[2] = real("aimz", -limit, limit);
+    }
+    std::vector<std::string> aimed, not_aimed;
     if (has("universe") != has("address") && !(has("universe") && wanted["universe"] == "0")) {
         std::printf("error\ta patch is a universe and an address; universe=0 unpatches\n");
         return 1;
@@ -1458,6 +1530,34 @@ int set_fixtures(const std::string& path, const std::string& library_dir, const 
             }
             place = true;
         }
+        if (aiming) {
+            // The type and mode it will have once this is done.
+            const GdtfResult& type = new_file.empty() ? type_of(now) : new_type;
+            const std::string aim_mode = !new_file.empty() ? new_modes[n] : has("mode") ? wanted["mode"] : now.mode;
+            std::string why;
+            if (!now.placed && !place) {
+                why = "unplaced";
+            } else if (!type.ok || type.fixture.modes.empty()) {
+                why = "unreadable";
+            } else {
+                const size_t index = static_cast<size_t>(std::max(type.fixture.find_mode(aim_mode), 0));
+                const FixtureModel model(type.fixture, index);
+                FixtureState state;
+                std::vector<ChannelValue> values;
+                model.evaluator().evaluate(nullptr, 0, values);
+                model.resolve(values, state);
+                for (const AxisState& axis : state.axes) {
+                    if (axis.motion == Motion::Pan || axis.motion == Motion::Tilt) why = "moves";    // the console aims it
+                }
+                if (why.empty() && !aim_at(world, rest_beams(type.fixture, index), aim)) why = "nobeam";
+            }
+            if (why.empty()) {
+                aimed.push_back(now.uuid);
+                place = true;
+            } else {
+                not_aimed.push_back(now.uuid + "\t" + why);
+            }
+        }
         if (place) {
             bool same = file && file->placed;
             for (int k = 0; same && k < 3; ++k) {
@@ -1593,6 +1693,8 @@ int set_fixtures(const std::string& path, const std::string& library_dir, const 
         return 1;
     }
     for (const RigFixture* fixture : chosen) std::printf("set\t%s\n", fixture->uuid.c_str());
+    for (const std::string& uuid : aimed) std::printf("aimed\t%s\n", uuid.c_str());
+    for (const std::string& line : not_aimed) std::printf("notaimed\t%s\n", line.c_str());    // uuid, then: moves, unplaced, nobeam, unreadable
     return 0;
 }
 
@@ -1695,12 +1797,148 @@ int make_movie(const std::string& out_path, const std::string& rate, const std::
     return 0;
 }
 
+// What a fixture does with some DMX: --state <file.gdtf> <mode name or number> [slot=level ...], slots of
+// break 1 counted from 1, levels 0-255, every other slot at its default.
+//   fog <0-1>   (a haze or fog machine only)
+//   axis <part> <pan|tilt|turn|slide> <degrees or metres>
+//   beam <part> <intensity 0-1> <strobe Hz> <r g b> <beam angle> <field angle> <gobo: wheel/slot or -> <gobo deg/s>
+//        <prism: slot or -> <prism copies> <iris> <frost> <defocus> <colour wheel turning: wheel or ->
+int state_of(const std::string& path, const std::string& mode_name, const std::vector<std::string>& levels) {
+    Archive archive;
+    std::string error;
+    if (!archive.open_file(path, error)) {
+        std::printf("error\t%s\n", field(error).c_str());
+        return 1;
+    }
+    const GdtfResult type = load_gdtf(archive);
+    if (!type.ok) {
+        std::printf("error\tits description cannot be read\n");
+        return 1;
+    }
+    size_t mode = type.fixture.modes.size();
+    for (size_t m = 0; m < type.fixture.modes.size(); ++m) {
+        if (type.fixture.modes[m].name == mode_name || std::to_string(m + 1) == mode_name) mode = m;
+    }
+    if (mode == type.fixture.modes.size()) {
+        std::printf("error\tno mode %s\n", field(mode_name).c_str());
+        return 1;
+    }
+    const FixtureModel model(type.fixture, mode);
+    if (!model.valid()) {
+        std::printf("error\tthe mode cannot be evaluated\n");
+        return 1;
+    }
+    std::vector<uint8_t> frame = model.evaluator().default_frame();
+    for (const std::string& level : levels) {
+        const size_t equals = level.find('=');
+        const int slot = equals == std::string::npos ? 0 : std::atoi(level.substr(0, equals).c_str());
+        const int value = equals == std::string::npos ? -1 : std::atoi(level.substr(equals + 1).c_str());
+        if (slot < 1 || slot > 512 || value < 0 || value > 255) {
+            std::printf("error\tnot slot=level: %s\n", field(level).c_str());
+            return 1;
+        }
+        if (frame.size() < static_cast<size_t>(slot)) frame.resize(static_cast<size_t>(slot), 0);
+        frame[static_cast<size_t>(slot - 1)] = static_cast<uint8_t>(value);
+    }
+    std::vector<ChannelValue> values;
+    model.evaluator().evaluate(frame.data(), frame.size(), values);
+    FixtureState state;
+    model.resolve(values, state);
+    static const char* motions[] = {"pan", "tilt", "turn", "slide"};
+    if (model.has_fog()) std::printf("fog\t%.4f\n", state.fog);    // a haze or fog machine: how hard it works, 0 to 1
+    for (const AxisState& axis : state.axes) {
+        std::printf("axis\t%s\t%s\t%.3f\n", field(model.geometry()[static_cast<size_t>(axis.geometry)].name).c_str(), motions[static_cast<int>(axis.motion)], axis.target);
+    }
+    for (const BeamState& beam : state.beams) {
+        const GateLayer& gobo = beam.layers[0];
+        const std::string gobo_name = gobo.wheel && gobo.slot >= 1 ? gobo.wheel->name + "/" + gobo.wheel->slots[static_cast<size_t>(gobo.slot - 1)].name : "-";
+        const PrismState& prism = beam.prisms[0];
+        std::printf("beam\t%s\t%.4f\t%.3f\t%.4f %.4f %.4f\t%.3f\t%.3f\t%s\t%.3f\t%s\t%zu\t%.3f\t%.3f\t%.3f\t%s\n",
+                    field(model.geometry()[static_cast<size_t>(beam.geometry)].name).c_str(), beam.intensity, beam.strobe_hz, beam.color.r, beam.color.g,
+                    beam.color.b, beam.beam_angle, beam.field_angle, field(gobo_name).c_str(), gobo.degrees_per_second,
+                    prism.slot ? field(prism.slot->name).c_str() : "-", prism.slot ? prism_images(*prism.slot).size() : size_t(0), beam.iris, beam.frost,
+                    beam.defocus, beam.wheel ? field(beam.wheel->name).c_str() : "-");
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if ((argc == 4 || argc == 5) && std::string(argv[1]) == "--export") return export_show(argv[2], argv[3], argc == 5 ? argv[4] : "");
     if (argc == 3 && std::string(argv[1]) == "--uses") return uses(argv[2]);
     if (argc >= 5 && std::string(argv[1]) == "--movie") return make_movie(argv[2], argv[3], std::vector<std::string>(argv + 4, argv + argc));
+    if (argc == 5 && std::string(argv[1]) == "--panorama") {
+        // prefix out.png width: the six views "<prefix>0.png" to "<prefix>5.png" (ahead, right, behind,
+        // left, up, down) made into one 360-degree picture, width by width / 2.
+        Image faces[6];
+        for (int f = 0; f < 6; ++f) {
+            const std::string face = std::string(argv[2]) + std::to_string(f) + ".png";
+            std::ifstream file = read_stream(face);
+            const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            ImageResult read = parse_png(bytes.data(), bytes.size());
+            if (!read.ok) {
+                std::printf("error\t%s cannot be read\n", field(face).c_str());
+                return 1;
+            }
+            faces[f] = std::move(read.image);
+        }
+        const Image round = equirect_from_faces(faces, std::atoi(argv[4]));
+        const std::vector<uint8_t> png = encode_png(round);
+        std::ofstream out = write_stream(std::string(argv[3]) + ".part");
+        out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+        out.close();
+        if (png.empty() || !out || !rename_file(std::string(argv[3]) + ".part", argv[3])) {
+            remove_file(std::string(argv[3]) + ".part");
+            std::printf("error\t%s\n", round.empty() ? "the six views are not squares of one size, or the width is not 64 to 16384" : "the picture cannot be written");
+            return 1;
+        }
+        std::printf("panorama\t%d\t%d\n", round.width, round.height);
+        return 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--psn") {
+        // One datagram from a file: "packet", its kind, frame and system; then "tracker", its id
+        // and name, and each field the packet gave, by name, with its numbers.
+        std::ifstream file = read_stream(argv[2]);
+        const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        const PsnPacket packet = parse_psn(bytes.data(), bytes.size());
+        if (packet.kind == PsnPacket::Kind::None) {
+            std::printf("error\tnot a PosiStageNet packet\n");
+            return 1;
+        }
+        std::printf("packet\t%s\t%u\t%s\n", packet.kind == PsnPacket::Kind::Data ? "data" : "info", static_cast<unsigned>(packet.frame),
+                    field(packet.system_name).c_str());
+        for (const PsnTracker& tracker : packet.trackers) {
+            std::printf("tracker\t%u\t%s", static_cast<unsigned>(tracker.id), field(tracker.name).c_str());
+            const struct { bool has; const char* name; const float* value; } threes[] = {
+                {tracker.has_position, "position", tracker.position}, {tracker.has_speed, "speed", tracker.speed},
+                {tracker.has_orientation, "orientation", tracker.orientation}, {tracker.has_acceleration, "acceleration", tracker.acceleration},
+                {tracker.has_target, "target", tracker.target}};
+            for (const auto& three : threes) {
+                if (three.has) std::printf("\t%s %g %g %g", three.name, static_cast<double>(three.value[0]), static_cast<double>(three.value[1]), static_cast<double>(three.value[2]));
+            }
+            if (tracker.has_validity) std::printf("\tvalidity %g", static_cast<double>(tracker.validity));
+            if (tracker.has_timestamp) std::printf("\ttimestamp %llu", static_cast<unsigned long long>(tracker.timestamp));
+            std::printf("\n");
+        }
+        return 0;
+    }
+    if (argc == 6 && std::string(argv[1]) == "--movie-sound") {
+        // in.mov sound.wav start out.mov: the movie again, with the sound from `start` seconds into it.
+        std::string error;
+        char* end = nullptr;
+        const double start = std::strtod(argv[4], &end);
+        if (!end || *end != '\0' || !std::isfinite(start)) {
+            std::printf("error\tthe start is a number of seconds\n");
+            return 1;
+        }
+        if (!movie_with_sound(argv[2], argv[3], start, argv[5], error)) {
+            std::printf("error\t%s\n", field(error).c_str());
+            return 1;
+        }
+        std::printf("movie\t%s\n", field(argv[5]).c_str());
+        return 0;
+    }
     if (argc == 10 && std::string(argv[1]) == "--add") return add(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argv[8], argv[9]);
     if (argc == 4 && std::string(argv[1]) == "--remove") return remove_or_restore(argv[2], argv[3], false);
     if (argc == 4 && std::string(argv[1]) == "--restore") return remove_or_restore(argv[2], argv[3], true);
@@ -1718,7 +1956,9 @@ int main(int argc, char** argv) {
     if (argc == 6 && std::string(argv[1]) == "--stand-in") return stand_in(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 4 && std::string(argv[1]) == "--no-stand-in") return no_stand_in(argv[2], argv[3]);
     if (argc == 8 && std::string(argv[1]) == "--correct") return correct(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
+    if (argc == 5 && std::string(argv[1]) == "--dimmer-curve") return set_curve(argv[2], argv[3], argv[4]);
     if (argc >= 6 && std::string(argv[1]) == "--set") return set_fixtures(argv[2], argv[3], argv[4], std::vector<std::string>(argv + 5, argv + argc));
+    if (argc >= 4 && std::string(argv[1]) == "--state") return state_of(argv[2], argv[3], std::vector<std::string>(argv + 4, argv + argc));
     if (argc == 3 && std::string(argv[1]) == "--patch") return patch(argv[2], "");
     if (argc != 2) {
         std::fprintf(stderr, "usage: vizcore_inspect [--summary | --patch | --plot | --screens | --walls | --models | --wheels] <file.gdtf | file.mvr | description.xml>\n       vizcore_inspect --export <rig.mvr> <out.mvr>\n");

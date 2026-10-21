@@ -29,12 +29,20 @@ ACameraActor* LvStage::Build(UWorld& World, float ExposureCompensation)
 		Floor->GetStaticMeshComponent()->SetMobility(EComponentMobility::Movable);
 		Floor->GetStaticMeshComponent()->SetStaticMesh(Plane);
 		Floor->SetActorScale3D(FVector(400.0, 400.0, 1.0));
-		// A plain dark floor. Left without a material the engine draws its grey test pattern on
-		// it, which at this size shows as blotches in every pool of light.
-		if (UMaterialInterface* Base = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial")))
+		Floor->Tags.Add(TEXT("LvFloor"));
+		// A plain dark floor, of the surface material models are drawn with (its colour and its
+		// roughness can be set: SetFloor). Left without a material the engine draws its grey test
+		// pattern on it, which at this size shows as blotches in every pool of light.
+		UMaterialInterface* Base = LoadObject<UMaterialInterface>(nullptr, TEXT("/LightingVisualizer/Materials/M_LvSurface.M_LvSurface"));
+		if (!Base)
+		{
+			Base = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+		}
+		if (Base)
 		{
 			UMaterialInstanceDynamic* Surface = UMaterialInstanceDynamic::Create(Base, Floor);
 			Surface->SetVectorParameterValue(TEXT("Color"), FLinearColor(0.14f, 0.14f, 0.14f));
+			Surface->SetScalarParameterValue(TEXT("Roughness"), 0.8f);
 			Floor->GetStaticMeshComponent()->SetMaterial(0, Surface);
 		}
 	}
@@ -67,6 +75,17 @@ ACameraActor* LvStage::Build(UWorld& World, float ExposureCompensation)
 	{
 		Variable->Set(-1.0f, ECVF_SetByCode);
 	}
+	// The engine's grid of which lights reach which part of the view holds 32 to a cell. A rig's
+	// spots overlap far more than a game's lights do: the owner's show at rest needed 611,363 places
+	// where there were 516,096, and the engine warned that "glitches will be visible". Four times as
+	// many costs a few megabytes.
+	if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Forward.MaxCulledLightsPerCell")))
+	{
+		if (Variable->GetInt() < 128)
+		{
+			Variable->Set(128, ECVF_SetByCode);
+		}
+	}
 	float BeamResolution = 100.0f;
 	if (FParse::Value(FCommandLine::Get(), TEXT("LvBeamRes="), BeamResolution))
 	{
@@ -86,6 +105,42 @@ void LvStage::SetExposure(UWorld& World, float ExposureCompensation)
 		if (Volume->bUnbound && Volume->Settings.bOverride_AutoExposureBias)
 		{
 			Volume->Settings.AutoExposureBias = ExposureCompensation;
+		}
+	}
+}
+
+void LvStage::SetFloor(UWorld& World, float Shade, float Roughness)
+{
+	for (TActorIterator<AStaticMeshActor> Floor(&World); Floor; ++Floor)
+	{
+		if (!Floor->Tags.Contains(TEXT("LvFloor")))
+		{
+			continue;
+		}
+		if (UMaterialInstanceDynamic* Surface = Cast<UMaterialInstanceDynamic>(Floor->GetStaticMeshComponent()->GetMaterial(0)))
+		{
+			const float Grey = FMath::Clamp(Shade, 0.0f, 1.0f);
+			Surface->SetVectorParameterValue(TEXT("Color"), FLinearColor(Grey, Grey, Grey));
+			Surface->SetScalarParameterValue(TEXT("Roughness"), FMath::Clamp(Roughness, 0.02f, 1.0f));
+		}
+	}
+}
+
+void LvStage::SetLook(UWorld& World, float Bloom, bool bMotionBlur, bool bLens)
+{
+	for (TActorIterator<APostProcessVolume> Volume(&World); Volume; ++Volume)
+	{
+		if (Volume->bUnbound && Volume->Settings.bOverride_AutoExposureBias)
+		{
+			Volume->Settings.bOverride_BloomIntensity = true;
+			Volume->Settings.BloomIntensity = FMath::Clamp(Bloom, 0.0f, 4.0f);
+			Volume->Settings.bOverride_MotionBlurAmount = true;
+			Volume->Settings.MotionBlurAmount = bMotionBlur ? 0.5f : 0.0f;    // 0.5: the engine's own amount
+			// The engine's own amounts when the lens is on.
+			Volume->Settings.bOverride_VignetteIntensity = true;
+			Volume->Settings.VignetteIntensity = bLens ? 0.4f : 0.0f;
+			Volume->Settings.bOverride_LensFlareIntensity = true;
+			Volume->Settings.LensFlareIntensity = bLens ? 1.0f : 0.0f;
 		}
 	}
 }

@@ -148,6 +148,8 @@ public:
 	bool bTypeInvertTilt = false;
 	double PanOffset = 0.0;
 	double TiltOffset = 0.0;
+	/** How its type's dimmer level becomes light in this show: a viz::DimmerCurve (0 linear, as the file has it). */
+	uint8 TypeDimmerCurve = 0;
 
 	/**
 	 * A fixture the rig file gives no place: it stands where whatever it sits in stands, on top

@@ -82,10 +82,24 @@ void ALvScreenActor::SetPicture(UTexture* Texture, float Brightness)
 			Material->SetTextureParameterValue(TEXT("Picture"), Texture);
 		}
 		Material->SetScalarParameterValue(TEXT("Nits"), Texture ? Brightness : 0.0f);
-		// The part of the picture: its left and top edge, its width and its height.
+		// The part of the picture: where the screen's top left corner is in it ("Part" x and y), and
+		// how far the picture moves across the screen's width ("Part" z and w) and down its height
+		// ("PartDown" x and y). An upright part moves only across, and only down.
 		const bool bWhole = Source == TEXT("pattern") || Source == TEXT("pixels") || !Trouble.IsEmpty();
-		Material->SetVectorParameterValue(TEXT("Part"), bWhole ? FLinearColor(0.0f, 0.0f, 1.0f, 1.0f)
-			: FLinearColor(static_cast<float>(Part.X), static_cast<float>(Part.Y), static_cast<float>(Part.Z - Part.X), static_cast<float>(Part.W - Part.Y)));
+		FLinearColor Corner(0.0f, 0.0f, 1.0f, 0.0f);
+		FLinearColor Down(0.0f, 1.0f, 0.0f, 0.0f);
+		if (!bWhole && bTurnedPart)
+		{
+			Corner = FLinearColor(static_cast<float>(TurnedPart[0]), static_cast<float>(TurnedPart[1]), static_cast<float>(TurnedPart[2]), static_cast<float>(TurnedPart[3]));
+			Down = FLinearColor(static_cast<float>(TurnedPart[4]), static_cast<float>(TurnedPart[5]), 0.0f, 0.0f);
+		}
+		else if (!bWhole)
+		{
+			Corner = FLinearColor(static_cast<float>(Part.X), static_cast<float>(Part.Y), static_cast<float>(Part.Z - Part.X), 0.0f);
+			Down = FLinearColor(0.0f, static_cast<float>(Part.W - Part.Y), 0.0f, 0.0f);
+		}
+		Material->SetVectorParameterValue(TEXT("Part"), Corner);
+		Material->SetVectorParameterValue(TEXT("PartDown"), Down);
 	}
 }
 
@@ -98,6 +112,32 @@ void ALvScreenActor::SetPart(const FVector4& Edges)
 	}
 	Part = Wanted;
 	SetPicture(Picture, Nits);
+}
+
+void ALvScreenActor::SetMap(bool bOn, const double InMap[6])
+{
+	bTurnedPart = bOn;
+	for (int32 Index = 0; Index < 6; ++Index)
+	{
+		TurnedPart[Index] = bOn ? InMap[Index] : (Index == 2 || Index == 5 ? 1.0 : 0.0);
+	}
+	SetPicture(Picture, Nits);
+}
+
+bool ALvScreenActor::HasMap(bool bOn, const double InMap[6]) const
+{
+	if (bOn != bTurnedPart)
+	{
+		return false;
+	}
+	for (int32 Index = 0; bOn && Index < 6; ++Index)
+	{
+		if (!FMath::IsNearlyEqual(TurnedPart[Index], InMap[Index], 1e-6))
+		{
+			return false;
+		}
+	}
+	return true;
 }
 
 void ALvScreenActor::GiveFeedBack()

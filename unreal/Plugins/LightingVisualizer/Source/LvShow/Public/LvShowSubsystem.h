@@ -44,6 +44,10 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FLvShowReadyToEdit, const FBox&);
  *   -LvExposure=<stops>       default -8, which suits photometric fixtures
  *   -LvHaze=<density>         fog density, 0 to 0.5 (default 0.06)
  *   -LvAmbient=<0..1>         house lights: an even light on everything (default 0, off)
+ *   -LvFloor=<0..1>           how rough the stage floor is: 0 a mirror, 1 matte (default 0.8)
+ *   -LvFloorShade=<0..1>      its colour, black to white (default 0.14, a dark grey)
+ *   -LvBloom=<0..4>           how far bright parts glow into what is around them (default 0.675, the engine's)
+ *   -LvMotionBlur=0|1         what moves fast is blurred along its path (default 1)
  *   -LvCameraAt=<x,y,z>       where the view starts, in centimetres (default: in front of the rig)
  *   -LvCameraLook=<x,y,z>     and what it looks at
  *   -LvView=<1..9>            start at that stored view; -LvStoreView=<1..9> stores the starting view under that number
@@ -70,13 +74,15 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FLvShowReadyToEdit, const FBox&);
  *   -LvShot=<file>            save a screenshot, -LvShotAfter=<seconds> in (default 8)
  *   -LvViewSelfTest           press the view keys the way a hand would (through the engine's input), check what they do, then quit
  *   -LvShotQuit               and quit once it is saved
+ *   -LvPanorama=<width>       take a 360-degree picture's six views by itself, -LvPanoramaAfter=<seconds> in (default 10);
+ *                             with -LvShotQuit, quit once they are saved. Openviz asks with the word "panorama" and a width
  *   -LvShowDump=<file>        write where every fixture is and how it is patched, for checks
  *   -LvQuitAfter=<seconds>    quit by itself, for checks
  *   -LvExec=<command>@<s>     run an engine console command that many seconds in, for looking into the picture's cost ("ProfileGPU@30")
  *   -LvFixtureLibrary=<dir>   the folder of GDTF files that fixtures added in Openviz take their types from
  *   -LvScreens=<file>         what the show's screens show, and screens added in Openviz (default: "<show>.screens.json" beside the show)
  *   -LvPieces=<file>          the set pieces added in Openviz: decks, drapes, trusses (default: "<show>.pieces.json" beside the show)
- *   -LvEditSelfTest           in the editor: move, re-patch and re-mode three fixtures, then quit
+ *   -LvEditSelfTest           in the editor: move, re-patch and re-mode three fixtures and move an added screen, then quit
  *   -LvEditDeleteTest         in the editor: delete the last fixture of the rig file and the last added one, then quit
  *
  * While watching: 1 to 9 go to a stored view, Shift with 1 to 9 stores the present one (kept
@@ -87,6 +93,7 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FLvShowReadyToEdit, const FBox&);
  *   -LvCommands=<file>        Openviz's word to a visualizer that is open, as JSON {"serial", "command", "value"}: looked at
  *                             several times a second and done when the serial changes. "view" with "1" to "9", "0", "top",
  *                             "front" or "side"; "store" with "1" to "9"; "picture" with "" (as on screen) or "3840x2160";
+ *                             "panorama" with the stitched picture's width ("8192"): six views, logged "panorama: views saved";
  *                             "record" with "start" or "stop": a video of the window, into -LvVideos.
  *   -LvVideos=<folder>        where videos recorded while watching go
  *   -LvRender=<file.dmxrec>   render this DMX recording into the movie -LvRenderOut=<file.mov>, frame by frame at
@@ -104,7 +111,8 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FLvShowReadyToEdit, const FBox&);
  * list), and what the screens show.
  */
 class FLvVideo;
-namespace viz { class DmxRecordingReader; }
+class FLvLightMeter;
+namespace viz { class DmxRecordingReader; class MovieWriter; }
 
 UCLASS()
 class LVSHOW_API ULvShowSubsystem : public UTickableWorldSubsystem
@@ -158,6 +166,35 @@ private:
 	FBox StageBounds() const;
 	void SpawnPieces(UWorld& World);
 	void FollowPiecesFile(UWorld& World);
+	// PosiStageNet (-LvPsnPort): what Openviz's receiver passes on, on this computer's own address, of
+	// a tracking system's trackers. Set pieces given a tracker follow it, only while watching.
+	void OpenPsn(int32 Port);
+	void ClosePsn();
+	void FollowTrackers();
+	struct FFollower
+	{
+		TWeakObjectPtr<class ALvSceneryActor> Actor;
+		int32 Tracker = 0;
+		bool bHeight = false;        // its height too; otherwise it keeps its own
+		double Z = 0.0;              // its own height and turn, in the rig file's terms
+		double Turn = 0.0;
+		FString Name;
+		bool bSaid = false;          // logged once that it follows
+	};
+	TArray<FFollower> Followers;
+	TArray<TWeakObjectPtr<class ALvSceneryActor>> People;    // added pieces that are people: not surfaces to read light on
+
+	// Light levels (the M key, or Openviz's word "meter"): what the beams give on the floor and on
+	// what stands on it, in lux, drawn over it in false colour (LvLightMeter.h).
+	TSharedPtr<FLvLightMeter> Meter;
+	double NextMeterSay = 0.0;
+	bool bMeterOnStart = false;      // -LvMeter=1: on once the stage has settled
+	void SetMeter(const FString& How);
+	void FollowMeter();
+	class FSocket* PsnSocket = nullptr;
+	TMap<int32, FVector> Trackers;   // where each tracker was last heard, in the rig file's terms (millimetres)
+	TMap<int32, FString> TrackerNames;
+	TSet<int32> TrackersSaid;
 	void ApplyHaze();
 	void SetBeamDetail(float Percent);
 	bool PlaceCamera(UWorld& World);
@@ -166,6 +203,14 @@ private:
 	void SaveViews() const;
 	void GlideTo(const FVector& Location, const FRotator& Rotation);
 	void TakePicture(int32 Width = 0, int32 Height = 0);
+	// Has the engine draw the present view once at that size and write it to `Path` (a PNG).
+	void RequestPicture(const FString& Path, int32 Width, int32 Height);
+	// A 360-degree picture: six square views 90 degrees wide, taken one after another from where the
+	// camera stands (ahead, right, behind, left, up, down), which Openviz stitches.
+	void StartPanorama(int32 Width);
+	void StepPanorama();
+	void AimPanorama();
+	void FinishPanorama(bool bSaved);
 
 	// Video: what the window shows, into a movie (LvVideo.h). Live while watching, on Openviz's word;
 	// or a DMX recording rendered frame by frame at a fixed time step (-LvRender).
@@ -188,6 +233,17 @@ private:
 	double RenderSaidAt = 0.0;
 	TSharedPtr<viz::DmxRecordingReader> Reader;
 	void StepRender();
+	// A render at a size of its own (-LvRenderSize=3840x2160), larger than the window can be: each
+	// frame is the engine's high-resolution shot of it, taken while the clock stands nearly still,
+	// and written into the movie here rather than by FLvVideo.
+	FIntPoint RenderSize = FIntPoint::ZeroValue;
+	int32 SizedStep = 0;             // 0 give the frame its DMX and camera, 1 ask for its shot, 2 wait for the shot
+	FString SizedShot;
+	int64 SizedSeenSize = -1;
+	double SizedSeenAt = 0.0;
+	double SizedAskedAt = 0.0;
+	TSharedPtr<viz::MovieWriter> SizedMovie;
+	bool StepSizedRender();
 
 	/** Views stored with the number keys, kept beside the show as "<show>.views.txt". */
 	struct FView
@@ -231,6 +287,10 @@ private:
 	FDateTime PictureStamp;
 	float ExposureNow = -8.0f;
 	float AmbientNow = 0.0f;
+	float FloorShade = 0.14f;        // the floor's colour, 0 black to 1 white
+	float FloorRoughness = 0.8f;     // 0 a mirror, 1 matte
+	float BloomNow = 0.675f;         // how far bright parts glow: the engine's bloom
+	bool bMotionBlur = true;
 	TWeakObjectPtr<class ASkyLight> AmbientLight;
 	bool bShowUnplaced = false;
 	// The picture settings every fixture gets, kept for fixtures that are built later.
@@ -253,10 +313,16 @@ private:
 	bool bScreensSettled = true;     // nothing more to say about them
 	FString ScreensFile;             // where Openviz keeps what the screens show; watched while the show runs
 	FDateTime ScreensStamp;          // when that file was last changed, as last seen
+	// In the editor: where each screen added in Openviz was put, so that one moved, turned or
+	// scaled there is written back into the screens file (SaveScreenMoves), as fixtures are into the edits.
+	TMap<TWeakObjectPtr<ALvScreenActor>, FTransform> ScreensPlaced;
+	void SaveScreenMoves();
 	FString ScreensShape;            // which screens there are and where: if this changes they are built again
 	double NextScreensLook = 0.0;
 	TSet<FString> HiddenLayers;      // chosen in Openviz not to be shown
 	TSet<FString> HiddenClasses;
+	TSet<FString> HiddenFixtureIds;  // the fixtures of groups hidden in Openviz, by uuid in capitals
+	bool IsFixtureHiddenByChoice(const ALvFixtureActor& Fixture) const;
 	TSet<int32> LiveUniverses;
 	FString Listening;
 	FString ShowPath;            // the MVR being shown; empty for a fixture preview
@@ -303,6 +369,17 @@ private:
 	float LookSpeed = 1.0f;
 	float MoveSpeed = 600.0f;
 	FString ShotPath;
+	int32 PanoramaStep = -1;         // the view being taken, 0 to 5; -1: no panorama under way
+	int32 PanoramaWidth = 0;         // the stitched picture's width
+	int32 PanoramaSide = 0;          // each view's pixels across and down
+	FString PanoramaPrefix;          // the views are "<prefix>0.png" to "<prefix>5.png"
+	double PanoramaAt = 0.0;         // when the view set up is taken; once asked for, when to give up
+	bool bPanoramaAsked = false;
+	int64 PanoramaSeenSize = -1;     // the present view's file size when last looked at
+	double PanoramaSeenAt = 0.0;
+	FRotator PanoramaFrom;           // where the camera looked before, to go back to
+	int32 PanoramaOnStart = 0;       // -LvPanorama=<width>: one taken by itself, for checks
+	double PanoramaOnStartAt = 10.0;
 	double ShotAfter = 8.0;
 	double Elapsed = 0.0;
 	double NextStatus = 0.0;

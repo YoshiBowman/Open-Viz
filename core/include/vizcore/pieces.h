@@ -25,6 +25,11 @@ struct SetPiece {
     // "person"  a figure `height` tall, facing along its own -Y (toward the house when not turned)
     // "circle"  a ring of box truss `width` across its middle line, `depth` its side, lying flat on its bottom chords
     // "corner"  two arms of box truss `width` long, along its own X and Y from a corner block, `depth` their side
+    // "triangle" triangle truss lying along its own X: `width` long, `depth` across its bottom chords, apex up
+    // "pipe"    a bar lying along its own X: `width` long, `depth` its diameter, its underside at its foot
+    // "boom"    an upright pipe `height` tall, `depth` its diameter, on a base plate `width` square
+    // "crowd"   an audience standing in a field `width` across and `depth` deep, people about `height` tall, facing +Y
+    // "stairs"  a flight of steps `width` wide climbing `height` over `depth` toward its own +Y, about 18 cm a step
     // "model"   a model file of the application's models folder (GLB, 3DS or OBJ), as big as it is
     std::string kind = "box";
     double width = 1.0;     // metres, along its own X
@@ -61,7 +66,8 @@ VIZCORE_API void piece_bounds(const SetPiece& piece, double low[3], double high[
 // "<show>.pieces.json"; the visualizer, the plot and the export read them from there:
 //
 //   {"pieces": [{"id": "piece-1", "kind": "truss", "name": "Truss 1", "colour": [0.45, 0.45, 0.45],
-//                "width": 12000, "depth": 290, "height": 290, "x": 0, "y": 0, "z": 6000, "turn": 0}]}
+//                "width": 12000, "depth": 290, "height": 290, "x": 0, "y": 0, "z": 6000, "turn": 0},
+//               {"id": "piece-2", "kind": "person", "name": "Singer", "tracker": 12, "follow_height": false}]}
 //
 // Measures and places in millimetres, MVR's coordinates; turn in degrees about the vertical,
 // anticlockwise seen from above.
@@ -71,6 +77,8 @@ struct PlacedPiece {
     SetPiece piece;        // its measures in metres, as piece_mesh wants them
     Transform world;       // where it stands, in the rig file's terms (millimetres)
     std::string model_path;    // a model's file, once resolve_models has found it
+    int tracker = 0;           // a PosiStageNet tracker it follows while watched ("tracker"), 0 for none
+    bool follow_height = false;    // and its height too ("follow_height"); otherwise it keeps its own z
 };
 
 // Entries that are not usable (no id, an id seen before, a kind there is no shape for, measures

@@ -47,6 +47,8 @@ const ICONS = {
   upload: [["path", { d: "M12 16V5M7 10l5-5 5 5M5 20h14" }]],
   folder: [["path", { d: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" }]],
   chevron: [["path", { d: "M9 6l6 6-6 6" }]],
+  up: [["path", { d: "M6 15l6-6 6 6" }]],
+  down: [["path", { d: "M6 9l6 6 6-6" }]],
   back: [["path", { d: "M15 6l-6 6 6 6" }]],
   check: [["path", { d: "M5 12.5l4.5 4.5L19 7" }]],
   alert: [["path", { d: "M12 3.5 2.5 20h19z" }], ["path", { d: "M12 10v4.5" }], ["circle", { cx: 12, cy: 17.3, r: 0.6, fill: "currentColor" }]],
@@ -250,8 +252,8 @@ function menuButton(label, items, options = {}) {
 }
 
 // A dialog over the page. `build(close)` gives its body and its buttons.
-function dialog(title, build) {
-  const box = el("dialog", { class: "modal" });
+function dialog(title, build, options = {}) {
+  const box = el("dialog", { class: options.wide ? "modal wide" : "modal" });
   const close = () => { box.close(); box.remove(); };
   const [body, buttons] = build(close);
   put(box, el("div", { class: "dialog-head" }, el("h3", {}, title),
@@ -494,7 +496,10 @@ function showTop(row, tab) {
   const counts = {
     types: (row.placeholders || []).length ? [String(row.placeholders.length), "warn"] : null,
     pieces: row.pieces ? [String(row.pieces), ""] : null,
-    layers: row.hidden && (row.hidden.layers.length + row.hidden.classes.length) ? [`${row.hidden.layers.length + row.hidden.classes.length} hidden`, ""] : null,
+    layers: (() => {    // layers, classes and groups hidden in the visualizer
+      const out = (row.hidden ? row.hidden.layers.length + row.hidden.classes.length : 0) + (row.groups || []).filter((group) => group.hidden).length;
+      return out ? [`${out} hidden`, ""] : null;
+    })(),
   };
   const layersOff = !((row.layer_list || []).length + (row.class_list || []).length);
   return el("div", { class: "show-top" },
@@ -725,10 +730,17 @@ function patchPanel(detail) {
 
   const select = (rows) => { kept.ticked.clear(); for (const row of rows) if (row.uuid) kept.ticked.add(row.uuid); draw(); redrawInspector(); };
   const loose = detail.fixtures.filter((row) => row.notes.includes("unplaced"));
+  // Groups of one's own: selected from here, made from what is selected, hidden from the Layers tab.
+  const groups = detail.groups || [];
+  const inGroup = (group) => { const ids = new Set(group.uuids.map((uuid) => uuid.toUpperCase())); return detail.fixtures.filter((row) => row.uuid && ids.has(row.uuid.toUpperCase())); };
   const selectMenu = menuButton("Select", [
     { label: "All Listed", hint: "Every fixture the filter shows", run: () => select(shown) },
     loose.length ? { label: `Unpositioned (${loose.length.toLocaleString()})`, hint: "Fixtures the MVR gives no position", run: () => select(loose) } : null,
     { label: "None", run: () => select([]) },
+    groups.length ? "-" : null,
+    ...groups.map((group) => ({ label: `${group.name} (${group.count.toLocaleString()})`, hint: group.hidden ? "Group, hidden in the visualizer" : "Group", run: () => select(inGroup(group)) })),
+    "-",
+    { label: "Save Selection as Group…", get disabled() { return !kept.ticked.size; }, hint: "Name the selected fixtures, to select them again or hide them together", run: () => groupDialog(detail.name, [...kept.ticked], groups) },
   ]);
   const noPlace = !loose.length ? null : notice(`${plural(loose.length, "fixture")} ${loose.length === 1 ? "has" : "have"} no position in the MVR: the console patched ${loose.length === 1 ? "it" : "them"} but never placed ${loose.length === 1 ? "it" : "them"} in 3D. ` +
     `${loose.length === 1 ? "It is" : "They are"} hidden, since ${loose.length === 1 ? "it" : "they"} would all light up in one spot. Select ${loose.length === 1 ? "it" : "them"}, give the first a position and set the spacing for the rest, or place them in the Unreal Editor.`, "info");
@@ -752,6 +764,28 @@ function patchPanel(detail) {
           (detail.open ? "This show is open in the visualizer: edits appear there within half a second." : "A show that is open in the visualizer picks up edits immediately.") +
           " The MVR file itself is never modified; Export MVR writes a new one.")),
       inspector));
+}
+
+// Naming selected fixtures as a group of the show, or adding them to one it has.
+function groupDialog(show, uuids, groups) {
+  dialog("Save as Group", (close) => {
+    const said = el("div");
+    const name = el("input", { type: "text", class: "wide", placeholder: "Group name", "aria-label": "Group name", autocomplete: "off" });
+    const into = el("select", { "aria-label": "Add to an existing group" }, el("option", { value: "" }, "A new group"),
+      groups.map((group) => el("option", { value: group.id }, `Add to ${group.name}`)));
+    into.addEventListener("change", () => { name.disabled = !!into.value; });
+    const save = el("button", { class: "primary" }, "Save Group");
+    save.addEventListener("click", busy(save, async () => {
+      if (into.value) await api("/api/group/set", { json: { name: show, id: into.value, changes: { add: uuids } } });
+      else await api("/api/group/add", { json: { name: show, group: name.value, uuids } });
+      close();
+      loadShows();
+    }, said));
+    const field = (text, control) => el("label", { class: "field" }, el("span", {}, text), control);
+    return [[el("p", { class: "muted" }, `${plural(uuids.length, "fixture")} selected. A group can be selected again from the Select menu, and hidden in the visualizer from the Layers tab.`),
+      groups.length ? field("Save To", into) : null, field("Name", name), said],
+      [el("button", { onclick: close }, "Cancel"), save]];
+  });
 }
 
 // The inspector beside the patch list, for the fixtures selected. For one fixture every field shows
@@ -862,11 +896,54 @@ function fixtureInspector(detail, chosen, kept) {
   const revertType = !retyped.length ? null : el("button", { title: "The fixture type and mode the MVR specifies" }, "Revert Type");
   if (revertType) revertType.addEventListener("click", busy(revertType, () => send({ reset: "type" }, `${plural(retyped.length, "fixture")} reverted to the MVR's fixture type.`, retyped), said));
 
+  // Aiming fixtures that do not pan or tilt: each is rotated where it hangs so that its beam points at a spot.
+  const still = live.filter((row) => !row.has_pan && !row.has_tilt);
+  const aimAt = ["x", "y", "z"].map((axis) => el("input", { type: "text", "aria-label": `Aim at ${axis}`, autocomplete: "off" }));
+  // Somewhere to aim at: the rig file's focus points, and the show's set pieces once they are fetched.
+  const targets = {};
+  const focusPoints = detail.focus_points || [];
+  focusPoints.forEach((point) => { targets[`focus:${point.uuid}`] = point.place; });
+  const aimPick = el("select", { "aria-label": "Aim at a focus point or set piece", class: "wide" }, el("option", { value: "" }, "Choose…"),
+    focusPoints.length ? el("optgroup", { label: "Focus Points" }, focusPoints.map((point) => el("option", { value: `focus:${point.uuid}` }, point.name))) : null);
+  const aimPieces = el("div", { class: "grow", hidden: !focusPoints.length }, el("label", { class: "field" }, el("span", {}, "Focus Point or Set Piece"), aimPick));
+  aimPick.addEventListener("change", () => {
+    const place = targets[aimPick.value];
+    if (place) place.forEach((value, index) => { aimAt[index].value = metres(value); });
+  });
+  // One fixture the rig file aims at a focus point: that point to start with.
+  if (one && one.focus && targets[`focus:${one.focus}`]) {
+    aimPick.value = `focus:${one.focus}`;
+    targets[aimPick.value].forEach((value, index) => { aimAt[index].value = metres(value); });
+  }
+  const aimButton = el("button", {}, still.length === 1 ? "Aim Fixture" : "Aim Fixtures");
+  const unaimed = { moves: "they pan or tilt, so the console aims them", unplaced: "they have no position yet", nobeam: "they have no beam", unreadable: "their fixture type cannot be read" };
+  aimButton.addEventListener("click", busy(aimButton, async () => {
+    const point = aimAt.map((box, index) => {
+      const text = box.value.trim().replace(",", ".");
+      const value = Number(text);
+      if (!text || !Number.isFinite(value)) throw new Error(`Aim At ${"XYZ"[index]} must be a number of metres.`);
+      return Math.round(value * 1000);
+    });
+    const answer = await api("/api/show/set", { json: { name: detail.name, uuids: still.map((row) => row.uuid), changes: { aimx: point[0], aimy: point[1], aimz: point[2] } } });
+    const reasons = [...new Set(answer.not_aimed.map((entry) => unaimed[entry.why] || entry.why))];
+    if (!answer.aimed.length) throw new Error(`Nothing was aimed: ${reasons.join("; ")}.`);
+    kept.note = [`${plural(answer.aimed.length, "fixture")} aimed at ${point.map((value) => metres(value)).join(", ")} m.` +
+      (answer.not_aimed.length ? ` ${plural(answer.not_aimed.length, "fixture")} not aimed: ${reasons.join("; ")}.` : ""), "ok"];
+    loadShows();
+  }, said));
+  for (const box of aimAt) box.addEventListener("keydown", (event) => { if (event.key === "Enter") aimButton.click(); });
+
   // Hanging them on a truss of the show's set pieces: at its height, spread evenly along it, rotated with it.
   const hang = el("div");
   if (live.length) {
     api(`/api/show/pieces?name=${encodeURIComponent(detail.name)}`).then((answer) => {
-      const trusses = answer.pieces.filter((piece) => piece.kind === "truss");
+      if (still.length && answer.pieces.length) {
+        // A set piece's middle, half way up: where a performer's chest or a deck's top would be lit.
+        answer.pieces.forEach((piece) => { targets[`piece:${piece.id}`] = [piece.x, piece.y, piece.z + piece.height / 2]; });
+        aimPick.append(el("optgroup", { label: "Set Pieces" }, answer.pieces.map((piece) => el("option", { value: `piece:${piece.id}` }, piece.name))));
+        aimPieces.hidden = false;
+      }
+      const trusses = answer.pieces.filter((piece) => ["truss", "triangle", "pipe"].includes(piece.kind));
       if (!trusses.length) return;
       const pick = el("select", { "aria-label": "Truss", class: "wide" }, trusses.map((truss) => el("option", { value: truss.id }, `${truss.name} (${metres(truss.width)} m)`)));
       const hangButton = el("button", {}, "Hang");
@@ -880,8 +957,8 @@ function fixtureInspector(detail, chosen, kept) {
                       stepx: Math.round(along[0] * spacing * 1000) / 1000, stepy: Math.round(along[1] * spacing * 1000) / 1000, rz: truss.turn },
           `${one ? title : plural(live.length, "fixture")} hung on ${truss.name}.`);
       }, said));
-      put(hang, el("h4", {}, "Hang on Truss"), el("div", { class: "grid2" }, pick, hangButton),
-        el("p", { class: "help" }, many ? "Spaced evenly along the truss, at its height." : "At the middle of the truss, at its height."));
+      put(hang, el("h4", {}, "Hang on Truss or Pipe"), el("div", { class: "grid2" }, pick, hangButton),
+        el("p", { class: "help" }, many ? "Spaced evenly along it, at its height." : "At its middle, at its height."));
     }).catch(() => null);
   }
   const loose = live.length && live.every((row) => row.notes.includes("unplaced"));
@@ -903,6 +980,11 @@ function fixtureInspector(detail, chosen, kept) {
         el("div", { class: "grid3" }, by.map((box, index) => field(["X", "Y", "Z"][index], box))),
         el("h4", {}, "Rotation (°)"),
         el("div", { class: "grid3" }, turn.map((box, index) => field(["X", "Y", "Z"][index], box))),
+        still.length ? [el("h4", {}, "Aim At (m)"),
+          el("div", { class: "grid3" }, aimAt.map((box, index) => field(["X", "Y", "Z"][index], box))),
+          el("div", { class: "fields tight" }, aimPieces, aimButton),
+          el("p", { class: "help" }, `Rotates ${still.length === 1 ? "the fixture" : `each of the ${still.length} fixtures`} where it hangs so that its beam points at this spot. ` +
+            "0, 0, 0 is the rig's origin, usually centre stage on the floor." + (still.length < live.length ? ` ${plural(live.length - still.length, "moving head")} ${live.length - still.length === 1 ? "is" : "are"} left as ${live.length - still.length === 1 ? "it is" : "they are"}: the console aims them.` : ""))] : null,
         pan || tilt ? [el("h4", {}, "Pan and Tilt"), el("div", { class: "grid2" }, pan ? field("Pan", pan) : null, tilt ? field("Tilt", tilt) : null),
           el("p", { class: "help" }, "For a fixture hung the other way round. If a whole fixture type moves the wrong way, correct it under Fixture Types.")] : null,
         loose ? el("p", { class: "help" }, many ? "These fixtures have no position yet. Give the first its X, Y and Z and a spacing (0.5 in X for a row half a metre apart); they appear once applied."
@@ -985,7 +1067,8 @@ function typesPanel(name) {
   const panel = el("div", {}, el("p", { class: "muted" }, "Loading fixture types…"));
   const said = el("div");
   // Kept outside the panel: a change draws the page again, and this panel with it.
-  const kept = typesKept[name] || (typesKept[name] = { found: {}, notes: {} });
+  const kept = typesKept[name] || (typesKept[name] = { found: {}, notes: {}, open: {} });
+  kept.open = kept.open || {};    // types the MVR describes whose replacing was asked for
   const found = kept.found;    // what GDTF Share has for a type, once searched
   const notes = kept.notes;    // what there is to say under a type: what was done, or why it could not be
   let asking = null;           // the download that waits for a GDTF Share sign-in: { spec, row }
@@ -1081,7 +1164,7 @@ function typesPanel(name) {
         const worst = entry.modes.reduce((most, mode) => mode.silent > most.silent ? mode : most, entry.modes[0] || { silent: 0, channels: 0 });
         if (entry.bare) lines.push(el("div", { class: "sub" }, `The MVR describes ${worst.channels - worst.silent} of ${plural(worst.channels, "channel")}${worst.silent < worst.channels ? ", so these fixtures only dim" : ", so DMX has no effect on them"}.`));
       }
-      if (entry.bare || entry.standin) {
+      if (entry.bare || entry.standin || kept.open[entry.spec]) {
         const fits = (row) => row.fits ? "matches" : `no ${entry.needs.map(slots).join(" or ")} mode`;
         const candidates = [];
         // From the library: what is called alike.
@@ -1115,7 +1198,13 @@ function typesPanel(name) {
             try { found[entry.spec] = await api(`/api/types/find?name=${encodeURIComponent(name)}&type=${encodeURIComponent(entry.spec)}`); notes[entry.spec] = null; }
             catch (error) { notes[entry.spec] = notice(error.code === "login_required" ? "Openviz has no GDTF Share fixture list yet. Sign in once under Fixture Library to download it." : error.message, "error"); }
             draw(answer);
-          }) }, icon("search"), share ? "Search GDTF Share Again" : "Search GDTF Share"), other));
+          }) }, icon("search"), share ? "Search GDTF Share Again" : "Search GDTF Share"), other,
+          el("button", { class: "small", title: "Describe the fixture from its manual and save it as a GDTF fixture type, when no file exists for it",
+            onclick: () => builderDialog({ show: name, type: entry.spec, file: ok && builtHere(entry.standin) ? entry.standin : "", done: (next) => {
+              notes[entry.spec] = notice(`${typeName(next.file)} is saved in your fixture library and replaces the console's placeholder.`, "ok");
+              draw(next.types);
+              loadShows();
+            } }) }, icon("edit"), ok && builtHere(entry.standin) ? "Edit in Fixture Builder" : "Build Fixture Type")));
       }
       // Which way its pan and tilt run, and from where: for every fixture of the type.
       const moves = [];
@@ -1139,7 +1228,19 @@ function typesPanel(name) {
         moves.push(entry.has_pan || entry.invert_pan ? invert("invert_pan", "pan") : null, entry.has_tilt || entry.invert_tilt ? invert("invert_tilt", "tilt") : null,
           entry.has_pan || entry.pan_offset ? offset("pan_offset", "pan") : null, entry.has_tilt || entry.tilt_offset ? offset("tilt_offset", "tilt") : null);
       }
-      lines.push(el("div", { class: "fields tight" }, moves.length ? el("span", { class: "small-text faint" }, "Movement:") : null, moves, el("span", { class: "grow" }),
+      // How its dimmer level becomes light: as the file has it, or bent as a dimmer rack would.
+      const CURVES = [["linear", "Linear"], ["square", "Square Law"], ["inverse-square", "Inverse Square"], ["s-curve", "S-Curve"]];
+      const curveBox = el("select", { class: "small", "aria-label": `${typeName(entry.name)}: dimmer curve`,
+        title: "How the dimmer level becomes light. Linear is as the fixture file has it; Square Law is how many dimmer racks drive incandescent lamps (half the level, a quarter of the light)." },
+        CURVES.map(([value, label]) => el("option", { value, selected: (entry.dimmer_curve || "linear") === value }, label)));
+      curveBox.addEventListener("change", () => act("/api/types/curve", { type: entry.spec, curve: curveBox.value },
+        () => `${typeName(entry.name)}: dimmer curve ${CURVES.find(([value]) => value === curveBox.value)[1]}.`, entry.spec));
+      moves.push(el("label", { class: "check small-text" }, "Dimmer curve", curveBox));
+      // A type the MVR describes can be replaced too: a console's generic dimmer by a PAR or a profile, say.
+      const replaceToo = !entry.bare && !entry.standin && !kept.open[entry.spec] ? el("button", { class: "small subtle",
+        title: "Replace this fixture type with one from your library, from GDTF Share or built in the Fixture Builder",
+        onclick: () => { kept.open[entry.spec] = true; draw(answer); } }, "Replace Type…") : null;
+      lines.push(el("div", { class: "fields tight" }, moves, el("span", { class: "grow" }), replaceToo,
         el("button", { class: "small subtle", title: "Excludes every fixture of this type from the visualizer, the plot and the patch. The MVR keeps them; Restore brings them back.",
           onclick: () => act("/api/types/remove", { type: entry.spec }, (next) => `${typeName(entry.name)}: ${plural(next.count, "fixture")} removed from the show.`, entry.spec) },
           entry.fixtures === 1 ? "Remove from Show" : `Remove All ${entry.fixtures} from Show`)));
@@ -1173,6 +1274,171 @@ function typesPanel(name) {
   return panel;
 }
 
+// ----------------------------------------------------------------------------- fixture builder
+
+// A file made by the Fixture Builder is named as GDTF Share names files, with Openviz as its revision.
+const builtHere = (file) => /@Openviz\.gdtf$/i.test(file || "");
+
+// The Fixture Builder: a fixture type described as its manual describes it, for a fixture that has
+// no GDTF file anywhere. Openviz writes the file into the fixture library. Opened for a show's
+// placeholder, it starts from the placeholder's modes and replaces the type when saved.
+// `from`: { file } to edit one it made, { show, type } for a placeholder, `done(answer)` once saved.
+// `again`: the dialog opened anew on a changed description (a template chosen), with what it had.
+async function builderDialog(from, again) {
+  const query = from.file ? `file=${encodeURIComponent(from.file)}` : from.show ? `name=${encodeURIComponent(from.show)}&type=${encodeURIComponent(from.type)}` : "";
+  let start = again;
+  if (!start) {
+    try { start = await api(`/api/builder${query ? `?${query}` : ""}`); }
+    catch (error) { pageNotice().replaceChildren(notice(error.message, "error")); return; }
+  }
+  const catalogue = start.catalogue;
+  const spec = JSON.parse(JSON.stringify(start.spec));
+  // What the console's placeholder takes in each mode: a replacement must take as many.
+  const consoleLengths = again ? again.console : from.show && !start.file ? Object.fromEntries(spec.modes.map((mode) => [mode.name, mode.channels.length])) : {};
+  const labels = {};
+  for (const group of catalogue.groups) for (const entry of group.functions) labels[entry.key] = entry.label;
+  const field = (text, control, help) => el("label", { class: "field" }, el("span", {}, text), control, help ? el("span", { class: "help" }, help) : null);
+  const textBox = (key, label) => {
+    const box = el("input", { type: "text", value: spec[key] || "", "aria-label": label, autocomplete: "off", spellcheck: "false" });
+    box.addEventListener("input", () => { spec[key] = box.value; });
+    return field(label, box);
+  };
+  // Numbers as the page shows them: `scale` turns the description's unit into the one shown (metres to millimetres).
+  const numberBox = (key, label, scale = 1) => {
+    const box = el("input", { type: "number", step: "any", value: String(Math.round(spec[key] * scale * 100) / 100), "aria-label": label });
+    box.addEventListener("input", () => { spec[key] = box.value.trim() === "" ? NaN : Number(box.value) / scale; });
+    return field(label, box);
+  };
+  const choiceBox = (key, label, options, then) => {
+    const box = el("select", { "aria-label": label }, options.map(([value, words]) => el("option", { value: String(value), selected: String(spec[key]) === String(value) }, words)));
+    box.addEventListener("change", () => { spec[key] = typeof options[0][0] === "number" ? Number(box.value) : box.value; if (then) then(); });
+    return field(label, box);
+  };
+
+  dialog(start.file ? `Edit ${typeName(start.file)}` : "Build Fixture Type", (close) => {
+    const said = el("div", { class: "grow" });
+    const movement = el("div", { class: "stack" }, el("h4", {}, "Movement"),
+      el("div", { class: "grid2" }, numberBox("pan_range", "Pan Range (°)"), numberBox("tilt_range", "Tilt Range (°)")));
+    const showKind = () => { movement.hidden = spec.kind === "static"; };
+    showKind();
+
+    // The colour wheel: slot 1 is open; each colour after it is a slot.
+    const colours = el("div", { class: "builder-list" });
+    const drawColours = () => put(colours, spec.colors.map((colour, index) => {
+      const pick = el("input", { type: "color", value: colour.hex, "aria-label": `Colour of slot ${index + 2}` });
+      pick.addEventListener("input", () => { colour.hex = pick.value; });
+      const named = el("input", { type: "text", value: colour.name, "aria-label": `Name of slot ${index + 2}`, autocomplete: "off" });
+      named.addEventListener("input", () => { colour.name = named.value; });
+      return el("div", { class: "builder-row" }, el("span", { class: "slot" }, String(index + 2)), pick, named,
+        el("button", { class: "subtle icon-only small", "aria-label": `Remove ${colour.name}`, title: "Remove", onclick: () => { spec.colors.splice(index, 1); drawColours(); } }, icon("close")));
+    }), el("div", { class: "button-row tight" },
+      el("button", { class: "small", disabled: spec.colors.length >= 30, onclick: () => { spec.colors.push({ name: "Colour", hex: "#ffffff" }); drawColours(); } }, icon("plus"), "Add Colour"),
+      spec.colors.length ? null : el("span", { class: "small-text faint" }, "No colour wheel.")));
+    drawColours();
+
+    // The DMX modes, one at a time, each a list of channels in DMX order.
+    let current = 0;
+    const modes = el("div", { class: "stack" });
+    const functionBox = (key, label) => el("select", { "aria-label": label }, catalogue.groups.map((group) =>
+      el("optgroup", { label: group.name }, group.functions.map((entry) => el("option", { value: entry.key, selected: entry.key === key }, entry.label)))));
+    const drawModes = () => {
+      const mode = spec.modes[current];
+      const named = el("input", { type: "text", value: mode.name, "aria-label": "Mode name", autocomplete: "off" });
+      named.addEventListener("input", () => { mode.name = named.value; });
+      named.addEventListener("change", drawModes);
+      const move = (from, to) => { const [key] = mode.channels.splice(from, 1); mode.channels.splice(to, 0, key); delete mode.pairs; drawModes(); };
+      // The placeholder's 16-bit pairs, as a hint while the channels are not yet set.
+      const pairs = mode.pairs || [];
+      const pairNote = (slot) => {
+        if (!pairs.length) return null;
+        const pair = pairs.find((entry) => entry.includes(slot));
+        return el("span", { class: "pair" }, pair ? el("span", { class: "badge", title: "The console's placeholder joins these two channels: a 16-bit channel and its Fine channel" },
+          slot === pair[0] ? `16-bit with ${pair[1]}` : `Fine of ${pair[0]}`) : null);
+      };
+      const rows = mode.channels.map((key, index) => {
+        const box = functionBox(key, `Channel ${index + 1}`);
+        box.addEventListener("change", () => { mode.channels[index] = box.value; });
+        return el("div", { class: "builder-row" }, el("span", { class: "slot" }, String(index + 1)), box, pairNote(index + 1),
+          el("button", { class: "subtle icon-only small", title: "Move Up", "aria-label": `Move channel ${index + 1} up`, disabled: index === 0, onclick: () => move(index, index - 1) }, icon("up")),
+          el("button", { class: "subtle icon-only small", title: "Move Down", "aria-label": `Move channel ${index + 1} down`, disabled: index === mode.channels.length - 1, onclick: () => move(index, index + 1) }, icon("down")),
+          el("button", { class: "subtle icon-only small", title: "Insert Channel Below", "aria-label": `Insert a channel after ${index + 1}`, disabled: mode.channels.length >= 512,
+            onclick: () => { mode.channels.splice(index + 1, 0, "unused"); delete mode.pairs; drawModes(); } }, icon("plus")),
+          el("button", { class: "subtle icon-only small", title: "Remove Channel", "aria-label": `Remove channel ${index + 1}`, disabled: mode.channels.length === 1,
+            onclick: () => { mode.channels.splice(index, 1); delete mode.pairs; drawModes(); } }, icon("close")));
+      });
+      const wanted = consoleLengths[mode.name];
+      const layouts = [["beam", "Beam Moving Head"], ["spot", "Spot Moving Head"], ["wash", "Wash Moving Head"], ["par", "LED Par"]];
+      put(modes,
+        el("div", { class: "toolbar" }, el("div", { class: "seg" }, spec.modes.map((entry, index) =>
+          el("button", { class: index === current ? "on" : "", onclick: () => { current = index; drawModes(); } }, `${entry.name || "Mode"} · ${entry.channels.length}`))),
+          el("span", { class: "grow" }),
+          menuButton([icon("more")], [
+            { label: "Add Mode", icon: "plus", disabled: spec.modes.length >= 12, run: () => {
+              spec.modes.push({ name: `Mode ${spec.modes.length + 1}`, channels: [...mode.channels] }); current = spec.modes.length - 1; drawModes(); } },
+            { label: "Remove This Mode", icon: "trash", danger: true, disabled: spec.modes.length === 1, run: () => { spec.modes.splice(current, 1); current = 0; drawModes(); } },
+            "-",
+            ...layouts.map(([key, words]) => ({ label: `Channels of a Typical ${words}`, hint: `${catalogue.layouts[key].length} channels, replacing these`,
+              run: () => { mode.channels = [...catalogue.layouts[key]]; delete mode.pairs; drawModes(); } })),
+          ], { class: "small subtle icon-only", title: "Mode actions" })),
+        field("Mode Name", named),
+        wanted && wanted !== mode.channels.length ? notice(`The console uses ${plural(wanted, "channel")} in this mode and this has ${mode.channels.length}. ` +
+          "A fixture type can only replace a placeholder whose channel count it matches.", "error") : null,
+        el("div", { class: "builder-list" }, rows),
+        el("div", { class: "button-row tight" }, el("button", { class: "small", disabled: mode.channels.length >= 512, onclick: () => { mode.channels.push("unused"); drawModes(); } }, icon("plus"), "Add Channel"),
+          el("span", { class: "small-text faint" }, "16-bit channels are a channel and its Fine channel, as the manual lists them.")));
+    };
+    drawModes();
+
+    const gobos = choiceBox("gobos", "Gobos", [[0, "None"], ...catalogue.patterns.map((pattern, index) => [index + 1, String(index + 1)])]);
+    // A template's typical figures over what is here; the dialog opens again with them.
+    const fromConsole = Object.keys(consoleLengths).length > 0;
+    const template = el("select", { "aria-label": "Start from a template", class: "wide" }, el("option", { value: "" }, "Choose…"),
+      catalogue.templates.map((entry) => el("option", { value: entry.key }, entry.label)));
+    template.addEventListener("change", busy(template, async () => {
+      if (!template.value) return;
+      const answer = await api("/api/builder/template", { json: { template: template.value, spec, keep_modes: fromConsole } });
+      close();
+      builderDialog(from, { catalogue, spec: answer.spec, file: start.file, console: consoleLengths, templated: true });
+    }, said));
+    const save = el("button", { class: "primary" }, icon("check"), from.show ? "Save and Replace" : "Save to Library");
+    save.addEventListener("click", busy(save, async () => {
+      const answer = await api("/api/builder/build", { json: Object.assign({ spec }, from.show ? { name: from.show, type: from.type } : {}) });
+      close();
+      if (from.done) from.done(answer);
+    }, said));
+    return [[el("div", { class: "builder" },
+      el("div", { class: "fields tight" }, el("label", { class: "field grow" }, el("span", {}, "Start From a Template"), template),
+        el("p", { class: "help grow" }, fromConsole ? "Fills in the beam, size, colours, gobos and prism with typical figures for the kind; the console's modes stay. Correct the figures from the manual."
+          : "Fills in everything with typical figures for the kind, channels included. Correct them from the manual.")),
+      again && again.templated ? notice("Template applied. Check the figures against the fixture's manual.", "info") : null,
+      from.show && !start.file && !again ? notice("Set up from the console's placeholder: its modes with their channel counts, and its dimmer channel. " +
+        "Fill in the rest from the fixture's manual: what each channel does, the beam, colours, gobos and prism.", "info") : null,
+      el("div", { class: "builder-columns" },
+        el("div", { class: "stack" },
+          el("h4", {}, "Fixture"),
+          el("div", { class: "grid2" }, textBox("manufacturer", "Manufacturer"), textBox("name", "Name")),
+          choiceBox("kind", "Kind", [["moving", "Moving head"], ["static", "Static fixture"]], showKind),
+          el("h4", {}, "Beam"),
+          el("div", { class: "grid3" }, choiceBox("lamp", "Light Source", [["LED", "LED"], ["Discharge", "Discharge lamp"], ["Tungsten", "Tungsten"]]),
+            choiceBox("beam_type", "Beam Type", [["Beam", "Beam"], ["Spot", "Spot"], ["Wash", "Wash"]]), numberBox("lumens", "Output (lm)")),
+          el("div", { class: "grid3" }, numberBox("beam_angle", "Beam Angle (°)"), numberBox("field_angle", "Field Angle (°)"), numberBox("color_temperature", "White (K)")),
+          el("div", { class: "grid2" }, numberBox("zoom_min", "Zoom, Narrowest (°)"), numberBox("zoom_max", "Zoom, Widest (°)")),
+          el("p", { class: "help" }, "Leave the zoom at 0 for a fixture without zoom. The beam angle is where the light falls to half; the field angle, to a tenth."),
+          movement,
+          el("h4", {}, "Size and Power"),
+          el("div", { class: "grid3" }, numberBox("width", "Width (mm)", 1000), numberBox("depth", "Depth (mm)", 1000), numberBox("height", "Height (mm)", 1000)),
+          el("div", { class: "grid2" }, numberBox("weight", "Weight (kg)"), numberBox("power", "Power (W)")),
+          el("h4", {}, "Colour Wheel"),
+          el("p", { class: "help" }, "Slot 1 is open. Add the wheel's colours in order."),
+          colours,
+          el("h4", {}, "Gobos and Prism"),
+          el("div", { class: "grid2" }, gobos, choiceBox("prism_facets", "Prism", [[0, "None"], [3, "3-facet"], [4, "4-facet"], [5, "5-facet"], [6, "6-facet"], [8, "8-facet"]])),
+          el("p", { class: "help" }, `Openviz draws simple gobo patterns in wheel order: ${catalogue.patterns.join(", ")}.`)),
+        el("div", { class: "stack" }, el("h4", {}, "DMX Modes"), modes)))],
+      [said, el("button", { onclick: close }, "Cancel"), save]];
+  }, { wide: true });
+}
+
 // --------------------------------------------------------------------------------- set pieces
 
 // A show's set pieces: a rig from a console often has no stage at all. Decks, drapes, trusses,
@@ -1200,6 +1466,11 @@ function piecesPanel(name) {
     person: [["height", "Height"]],
     circle: [["width", "Diameter"], ["depth", "Profile"]],
     corner: [["width", "Arm Length"], ["depth", "Profile"]],
+    triangle: [["width", "Length"], ["depth", "Profile"]],
+    pipe: [["width", "Length"], ["depth", "Diameter"]],
+    boom: [["height", "Height"], ["width", "Base"]],
+    crowd: [["width", "Width"], ["depth", "Depth"], ["height", "Height"]],
+    stairs: [["width", "Width"], ["depth", "Run"], ["height", "Height"]],
     model: [],
   };
   const UNITS = [["", "As in file"], ["mm", "Millimetres"], ["cm", "Centimetres"], ["m", "Metres"], ["in", "Inches"], ["ft", "Feet"]];
@@ -1248,6 +1519,20 @@ function piecesPanel(name) {
           if (chosen.path) { await send({ picture: chosen.path }); draw(await api(`/api/show/pieces?name=${encodeURIComponent(name)}`)); }
         }, said) }, piece.picture ? piece.picture.split(/[\\/]/).pop() : "Browse…"),
         piece.picture ? el("button", { class: "subtle icon-only", "aria-label": "Remove the picture", onclick: async () => { await send({ picture: "" }); draw(await api(`/api/show/pieces?name=${encodeURIComponent(name)}`)); } }, icon("close")) : null));
+      // A tracker of a tracking system (PosiStageNet) it follows while a show is watched: a performer, a moving set piece.
+      const tracker = el("input", { type: "text", class: "narrow", value: piece.tracker ? String(piece.tracker) : "", placeholder: "None",
+        "aria-label": `${piece.name}: PosiStageNet tracker`, autocomplete: "off", inputmode: "numeric" });
+      tracker.addEventListener("change", async () => {
+        const text = tracker.value.trim();
+        const value = Number(text);
+        if (text && !(Number.isInteger(value) && value >= 1 && value <= 65535)) { said.replaceChildren(notice("A tracker is a number from 1 to 65535, or empty for none.", "error")); return; }
+        await send({ tracker: text ? value : null }, tracker);
+        draw(await api(`/api/show/pieces?name=${encodeURIComponent(name)}`));
+      });
+      const height = el("input", { type: "checkbox", checked: !!piece.follow_height, "aria-label": `${piece.name}: follow the tracker's height` });
+      height.addEventListener("change", () => send({ follow_height: height.checked }));
+      const follows = [field("Follows Tracker", tracker),
+        piece.tracker ? el("label", { class: "check", title: "Off: the piece stays at its own Z and follows the tracker across the floor" }, height, "Follow Height") : null];
       const model = piece.kind !== "model" ? [] : [
         choose("file", [...new Set([piece.file, ...answer.models])].map((file) => [file, file]), "File"),
         choose("units", UNITS, "Units"), choose("up", UPS, "Up Axis")];
@@ -1257,7 +1542,7 @@ function piecesPanel(name) {
           el("button", { class: "small subtle danger", onclick: () => act("/api/piece/remove", { id: piece.id }) }, icon("trash"), "Remove")),
         el("div", { class: "fields" }, field("Name", named), model, MEASURES[piece.kind].map(([key, label]) => length(key, `${label} (m)`)),
           length("x", "X (m)"), length("y", "Y (m)"), length("z", "Z (m)"), field("Rotation (°)", turn),
-          piece.kind === "model" ? null : field("Colour", colour), picture),
+          piece.kind === "model" ? null : field("Colour", colour), picture, follows),
         piece.trouble ? notice(piece.trouble, "error") : null);
     };
     const addModel = async () => {
@@ -1281,9 +1566,10 @@ function piecesPanel(name) {
       said,
       answer.pieces.length ? el("div", { class: "card" }, answer.pieces.map(line))
         : el("div", { class: "empty" }, el("b", {}, "No set pieces"), "Use Add Set Piece to build the stage."),
-      el("p", { class: "help" }, "X runs toward stage left (house right), Y upstage, Z up. Truss lies along X until rotated, with Z at its underside where fixtures hang. A truss circle lies flat around its centre; a corner's arms run along X and Y. " +
+      el("p", { class: "help" }, "X runs toward stage left (house right), Y upstage, Z up. Truss and pipes lie along X until rotated, with Z at their underside where fixtures hang. A truss circle lies flat around its centre; a corner's arms run along X and Y; a boom stands on its base; a crowd fills its width and depth with people about its height, facing upstage; stairs climb upstage to their height, about 18 cm a step, so set in front of a deck they lead onto it. " +
         "A drape faces the house and can carry a printed picture (a box or deck too, on its front). A model's size comes from its file (GLB in metres, 3DS in millimetres, OBJ as written): if it is far too large or lying down, set its units and up axis. " +
-        "GLB files carry their colours and textures; an OBJ needs its MTL file and textures beside it, which 3D Model File… brings along. Beams land on and are cut by set pieces, which also appear on the light plot and in MVR exports."));
+        "GLB files carry their colours and textures; an OBJ needs its MTL file and textures beside it, which 3D Model File… brings along. Beams land on and are cut by set pieces, which also appear on the light plot and in MVR exports. " +
+        "A piece given a tracker moves with it while a show is watched, as a tracking system sends it over PosiStageNet (Connections); it stands at its own position until the tracker is heard."));
   };
   gather(api(`/api/show/pieces?name=${encodeURIComponent(name)}`)).then(draw).catch((error) => put(panel, notice(error.message, "error")));
   return panel;
@@ -1359,6 +1645,17 @@ function screensPanel(name) {
           list.replaceChildren(...streams.map((stream) => el("option", { value: stream })));
           said.replaceChildren(notice(streams.length ? "NDI streams on the network: " : "No NDI streams are being sent on the network right now.", streams.length ? "ok" : "info",
             ...streams.map((stream, index) => [index ? ", " : "", el("button", { class: "link", onclick: () => send({ value: stream }) }, stream)])));
+          // A stream the show names that is not there, and one that is called nearly the same: every screen showing it, in one go.
+          const plain = (text) => text.toLowerCase().replace(/[^a-z0-9]/g, "");
+          const named = new Set(answer.screens.flatMap((one) => [one, ...one.sections]).filter((one) => one.source === "ndi" && one.value).map((one) => one.value));
+          for (const missing of [...named].filter((value) => !streams.includes(value))) {
+            const near = streams.filter((stream) => plain(stream).includes(plain(missing).replace(/^.*?(mix|out)/, "$1")) || plain(stream) === plain(missing));
+            said.append(notice(`${missing} is not on the network. `, "info", near.length === 1
+              ? el("button", { class: "link", onclick: busy(null, async () => {
+                draw(await api("/api/screen/stream", { json: { name, old: missing, new: near[0] } }));
+                said.replaceChildren(notice(`Every screen that showed ${missing} now shows ${near[0]}.`, "ok"));
+              }, said) }, `Use ${near[0]} on every screen that shows it`) : "Is its sender on, and on this network?"));
+          }
         }, said) }, "Find Streams"))));
       } else if (target.source === "pixels" && target.pixels) {
         // An LED strip or a low-resolution wall: its pixels take their levels from DMX, in order, from an address on.
@@ -1382,10 +1679,13 @@ function screensPanel(name) {
         const parts = [["whole", "Whole picture", [0, 0, 1, 1]]];
         if (target.own) parts.unshift(["own", "Its part of the screen's picture", target.own]);
         parts.push(["left", "Left half", [0, 0, 0.5, 1]], ["right", "Right half", [0.5, 0, 1, 1]], ["top", "Top half", [0, 0, 1, 0.5]], ["bottom", "Bottom half", [0, 0.5, 1, 1]]);
-        const now = parts.find((entry) => same(entry[2], target.part));
+        // A part laid out turned in the picture, as an LED processor's map has it, is shown as such; choosing another replaces it.
+        if (target.map) parts.unshift(["mapped", "Its mapped part (turned)", null]);
+        const now = target.map ? parts[0] : parts.find((entry) => same(entry[2], target.part));
         const percent = (edge) => `${+(edge * 100).toFixed(1)}%`;
         controls.push(field("Crop", el("select", { "aria-label": `Which part of its picture ${label} shows`, onchange: (event) => {
           const chosen = parts.find((entry) => entry[0] === event.target.value);
+          if (chosen && chosen[0] === "mapped") return;
           if (chosen) send({ part: chosen[0] === "own" || chosen[0] === "whole" ? (target.own ? chosen[0] : chosen[2]) : chosen[2] });
         } }, parts.map((entry) => el("option", { value: entry[0], selected: entry === now }, entry[1])),
           now ? null : el("option", { value: "other", selected: true }, `${percent(target.part[0])}, ${percent(target.part[1])} to ${percent(target.part[2])}, ${percent(target.part[3])}`))));
@@ -1511,10 +1811,31 @@ function layersPanel(row) {
       const holds = [entry.fixtures ? plural(entry.fixtures, "fixture") : "", entry.pieces ? plural(entry.pieces, "set piece") : ""].filter(Boolean).join(", ");
       return el("label", { class: "entry entry-head check" }, box, el("span", { class: "name" }, entry.name || "(unnamed)"), el("span", { class: "grow" }), el("span", { class: "muted small-text" }, holds));
     }));
+  // Groups made in the Patch tab: shown or hidden in the visualizer, renamed, selected, removed.
+  const groupAct = async (path, body, text) => {
+    try { await api(path, { json: Object.assign({ name: row.name }, body) }); status.replaceChildren(text ? notice(text, "ok") : ""); loadShows(); }
+    catch (error) { status.replaceChildren(notice(error.message, "error")); }
+  };
+  const groups = row.groups || [];
+  const groupCard = el("div", { class: "card" },
+    el("div", { class: "card-head" }, el("h3", {}, "Groups"), el("span", { class: "sub" }, groups.length ? `${groups.length - groups.filter((g) => g.hidden).length} of ${groups.length} visible` : "")),
+    groups.length ? groups.map((group) => {
+      const box = el("input", { type: "checkbox", checked: !group.hidden, "aria-label": `${group.name} visible` });
+      box.addEventListener("change", () => groupAct("/api/group/set", { id: group.id, changes: { hidden: !box.checked } }, "Saved. A show that is open picks this up immediately."));
+      const named = el("input", { type: "text", class: "mid", value: group.name, "aria-label": "Group name", autocomplete: "off" });
+      named.addEventListener("change", () => groupAct("/api/group/set", { id: group.id, changes: { name: named.value } }));
+      return el("div", { class: "entry entry-head" }, el("label", { class: "check" }, box), named, el("span", { class: "grow" }),
+        el("span", { class: "muted small-text" }, plural(group.count, "fixture")),
+        el("button", { class: "small", onclick: () => {
+          (patchKept[row.name] = patchKept[row.name] || newPatchKept()).ticked = new Set(group.uuids);
+          go("show", { show: row.name, tab: "patch" });
+        } }, "Select in Patch"),
+        el("button", { class: "small subtle danger", onclick: () => groupAct("/api/group/remove", { id: group.id }, `${group.name} removed; its fixtures stay in the show.`) }, icon("trash"), "Remove"));
+    }) : el("p", { class: "muted entry" }, "No groups yet. In the Patch tab, select fixtures, then Select › Save Selection as Group…"));
   return el("div", {},
-    el("p", { class: "muted" }, "Hide a layer or class to leave its contents out of the visualizer. Hidden fixtures stay patched; they are just not drawn or lit."),
+    el("p", { class: "muted" }, "Hide a layer, class or group to leave its contents out of the visualizer. Hidden fixtures stay patched; they are just not drawn or lit."),
     status,
-    el("div", { class: "stack" }, list("Layers", "layers", row.layer_list || []), list("Classes", "classes", row.class_list || [])));
+    el("div", { class: "stack" }, groupCard, list("Layers", "layers", row.layer_list || []), list("Classes", "classes", row.class_list || [])));
 }
 
 // ---------------------------------------------------------------------------------- paperwork
@@ -1771,6 +2092,20 @@ async function search() {
   put(results, out);
 }
 
+// A fixture type's own picture, fetched once (with the page's token, so as a blob) and kept for redraws.
+const thumbnails = new Map();
+function thumbnail(file) {
+  const holder = el("div", { class: "thumb", "aria-hidden": "true" }, icon("box"));
+  let wanted = thumbnails.get(file);
+  if (!wanted) {
+    wanted = fetch(`/api/fixtures/thumbnail?file=${encodeURIComponent(file)}`, { headers: { "X-Launcher-Token": token } })
+      .then((response) => (response.ok ? response.blob() : null)).then((blob) => (blob ? URL.createObjectURL(blob) : null)).catch(() => null);
+    thumbnails.set(file, wanted);
+  }
+  wanted.then((url) => { if (url) holder.replaceChildren(el("img", { src: url, alt: "" })); });
+  return holder;
+}
+
 function fixtureItem(row) {
   const title = row.name ? `${row.manufacturer || ""} ${row.name}`.trim() : bare(row.file);
   let verdict;
@@ -1782,10 +2117,26 @@ function fixtureItem(row) {
   const blocked = ready() || (row.error ? "This file cannot be opened." : "");
   const mode = el("select", { "aria-label": `DMX mode for ${title}` },
     (row.modes || []).map((entry) => el("option", { value: entry.name }, `${entry.name} (${entry.footprint} ch)`)));
-  return el("div", { class: "row-item" },
-    el("div", { class: "body" }, el("div", { class: "title" }, title, " ", verdict),
+  // A newer upload of it on GDTF Share: fetched, and put in its place in the shows that use it.
+  const update = !row.update ? null : el("button", { title: `Downloads ${row.update.revision || "the newer revision"} from GDTF Share and uses it in place of this one in your shows. This file is kept.` },
+    icon("download"), "Update");
+  if (update) update.addEventListener("click", busy(update, async () => {
+    let answer;
+    try { answer = await api("/api/fixtures/update", { json: { file: row.file } }); }
+    catch (error) { if (error.code === "login_required") return failed(error); throw error; }
+    const shows = [...new Set(answer.replaced.map((entry) => bare(entry.show)))];
+    pageNotice().replaceChildren(notice(`${typeName(answer.file)} downloaded.${shows.length ? ` It now replaces the older revision in ${shows.join(", ")}.` : ""}`, "ok",
+      answer.kept.map((entry) => el("div", {}, `${bare(entry.show)}, ${typeName(entry.type)}: kept the older revision. ${entry.why}`))));
+    loadLibrary();
+  }));
+  return el("div", { class: "row-item" }, thumbnail(row.file),
+    el("div", { class: "body" }, el("div", { class: "title" }, title, " ", verdict, row.update ? [" ", el("span", { class: "badge info", title: `${row.update.revision} is on GDTF Share` }, "Update Available")] : null),
       el("div", { class: "meta" }, row.error ? `Cannot be read: ${row.error}` : [row.revision, modesText(row.modes || []), size(row.size)].filter(Boolean).join(" · "))),
-    el("div", { class: "actions" }, (row.modes || []).length > 1 ? mode : null,
+    el("div", { class: "actions" }, (row.modes || []).length > 1 ? mode : null, update,
+      row.built ? el("button", { title: "Opens this fixture type in the Fixture Builder", onclick: () => builderDialog({ file: row.file, done: (answer) => {
+        pageNotice().replaceChildren(notice(`${typeName(answer.file)} is saved. Shows that use it pick up the change the next time they are opened.`, "ok"));
+        loadLibrary();
+      } }) }, icon("edit"), "Edit") : null,
       el("button", { title: blocked || "Opens a row of this fixture type in the visualizer", disabled: !!blocked, onclick: (event) => launch("fixture", row.file, { mode: mode.value }, event.currentTarget) }, icon("play"), "Preview")));
 }
 
@@ -1965,6 +2316,27 @@ async function takeAction(path, body, said) {
   loadTakes();
 }
 
+// Keeping a part of a recording as a recording of its own, to render that part alone.
+function trimDialog(take) {
+  dialog("Trim Recording", (close) => {
+    const said = el("div");
+    const box = (label, value) => el("input", { type: "number", min: "0", step: "0.1", value: String(value), "aria-label": label, class: "wide" });
+    const start = box("Start, seconds", 0);
+    const end = box("End, seconds", take.seconds);
+    const keep = el("button", { class: "primary" }, "Keep This Part");
+    keep.addEventListener("click", busy(keep, async () => {
+      const answer = await api("/api/recording/trim", { json: { name: take.name, start: Number(start.value), end: Number(end.value) } });
+      close();
+      takesNotice = notice(`Kept ${clock(answer.seconds)} as ${answer.name.replace(/\.dmxrec$/, "")}.`, "ok");
+      loadTakes();
+    }, said));
+    const field = (text, control) => el("label", { class: "field" }, el("span", {}, text), control);
+    return [[el("p", { class: "muted" }, `${take.name.replace(/\.dmxrec$/, "")} is ${clock(take.seconds)} long. The part is kept as a new recording that starts with the look as it stood at its start; this one stays as it is.`),
+      el("div", { class: "grid2" }, field("Start (s)", start), field("End (s)", end)), said],
+      [el("button", { onclick: close }, "Cancel"), keep]];
+  });
+}
+
 function takesPanel() {
   if (!takes) return el("p", { class: "muted" }, "Loading recordings…");
   const now = takes.state;
@@ -1980,9 +2352,11 @@ function takesPanel() {
     return el("div", { class: "row-item" },
       el("div", { class: "body" }, el("div", { class: "title" }, take.name.replace(/\.dmxrec$/, "")),
         el("div", { class: "meta" }, playing ? `${facts} · playing ${clock(now.position)} of ${clock(now.length)}` : facts)),
-      el("div", { class: "actions" }, playing
-        ? el("button", { class: "primary", onclick: () => takeAction("/api/play/stop") }, icon("stop"), "Stop")
-        : el("button", { disabled: !!take.error || !take.frames, onclick: () => takeAction("/api/play/start", { name: take.name, loop: true }) }, icon("play"), "Play")));
+      el("div", { class: "actions" },
+        el("button", { class: "subtle", disabled: !!take.error || !take.frames, onclick: () => trimDialog(take) }, "Trim…"),
+        playing
+          ? el("button", { class: "primary", onclick: () => takeAction("/api/play/stop") }, icon("stop"), "Stop")
+          : el("button", { disabled: !!take.error || !take.frames, onclick: () => takeAction("/api/play/start", { name: take.name, loop: true }) }, icon("play"), "Play")));
   });
   const videos = (takes.videos || []).map((video) => el("div", { class: "row-item" },
     el("div", { class: "body" }, el("div", { class: "title" }, video.name),
@@ -2004,6 +2378,7 @@ function takesPanel() {
 // Rendering a recording to video: a show, a recording, a frame rate and a view. The visualizer
 // opens, draws every frame in full at a steady clock and closes when the recording ends.
 let renderNotice = null;
+const renderSound = { path: "", start: "0" };    // the sound a render's video carries, kept while the page is drawn again
 function renderForm() {
   const shows = takes.shows || [];
   if (!shows.length) return null;
@@ -2014,11 +2389,24 @@ function renderForm() {
   const view = el("select", { "aria-label": "Starting view" }, el("option", { value: "0" }, "Default view"),
     [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => el("option", { value: String(n) }, `View ${n}`)));
   const then = el("input", { type: "text", class: "mid", "aria-label": "Camera moves", placeholder: "e.g. 3@8 5@15", autocomplete: "off" });
+  // The song the recording was made to: chosen in the system's file window, and where in it the recording starts.
+  const soundName = el("span", { class: "small-text" }, renderSound.path ? renderSound.path.split(/[\\/]/).pop() : "None");
+  const chooseSound = el("button", { class: "small" }, renderSound.path ? "Change…" : "Choose…");
+  chooseSound.addEventListener("click", busy(chooseSound, async () => {
+    const answer = await api("/api/sound/choose", { json: {} });
+    if (answer.path) { renderSound.path = answer.path; if ($("takes")) put($("takes"), takesPanel()); }
+  }));
+  const noSound = !renderSound.path ? null : el("button", { class: "small subtle", onclick: () => { renderSound.path = ""; if ($("takes")) put($("takes"), takesPanel()); } }, "Remove");
+  const soundStart = el("input", { type: "number", class: "narrow", step: "0.01", value: renderSound.start, "aria-label": "Sound starts at, seconds",
+    oninput: (event) => { renderSound.start = event.target.value; } });
   const go = el("button", { class: "primary", onclick: async () => {
     go.disabled = true;
     renderNotice = null;
     try {
-      renderRun(await api("/api/render", { json: { name: show.value, recording: take.value, rate: Number(rate.value), view: Number(view.value), path: then.value.trim() ? `${view.value} ${then.value}` : "" } }));
+      const start = Number(String(renderSound.start).replace(",", "."));
+      if (renderSound.path && !Number.isFinite(start)) throw new Error("Where the sound starts is a number of seconds.");
+      renderRun(await api("/api/render", { json: { name: show.value, recording: take.value, rate: Number(rate.value), view: Number(view.value), path: then.value.trim() ? `${view.value} ${then.value}` : "",
+        sound: renderSound.path, sound_start: renderSound.path ? start : 0 } }));
       pollRun();
       renderNotice = notice("Rendering. The visualizer window shows the progress and closes by itself when done.", "ok");
     } catch (error) { renderNotice = notice(error.message, "error"); }
@@ -2027,9 +2415,12 @@ function renderForm() {
   return el("div", { class: "card" }, el("div", { class: "card-head" }, el("div", {}, el("h3", {}, "Render to Video"), el("div", { class: "sub" }, "Plays a recording through a show at a steady clock and writes every frame to a movie."))),
     el("div", { class: "card-body" },
       el("div", { class: "fields" }, field("Show", show), field("Recording", take), field("Frame Rate", rate), field("Start From", view), field("Camera Moves", then), go),
+      el("div", { class: "fields tight" }, el("span", { class: "small-text faint" }, "Sound:"), soundName, chooseSound, noSound,
+        renderSound.path ? [el("span", { class: "small-text faint" }, "starting"), soundStart, el("span", { class: "small-text faint" }, "seconds in")] : null),
       renderNotice,
       el("p", { class: "help" }, `The movie is the visualizer window's size (${(state.settings.resolution || "").replace("x", " × ")}, under Visualizer). Every frame is rendered in full, so a heavy look takes longer, not less smooth. ` +
-        "Only the recording drives the fixtures. Camera moves glide between stored views: “3@8 5@15” reaches view 3 at 8 seconds and view 5 at 15; naming a view twice holds it. The movie appears under Videos and is converted to MP4.")));
+        "Only the recording drives the fixtures. Camera moves glide between stored views: “3@8 5@15” reaches view 3 at 8 seconds and view 5 at 15; naming a view twice holds it. " +
+        "With a sound file (the song the recording was made to), the video carries it: “starting 12.5 seconds in” if the recording began 12.5 seconds into the song, a negative number if it began before. The movie appears under Videos and is converted to MP4.")));
 }
 
 function renderRecordings() {
@@ -2178,17 +2569,80 @@ function oscPanel() {
   ];
 }
 
+// PosiStageNet: a tracking system says where performers and moving scenery are; set pieces given
+// a tracker follow it. Openviz's DMX receiver hears it and passes it on to the visualizer.
+let psnState = null;
+let psnTimer = null;
+let psnNotice = null;
+
+async function loadPsn(changes) {
+  clearTimeout(psnTimer);
+  psnNotice = null;
+  try { psnState = await api("/api/psn", changes ? { json: changes } : {}); } catch (error) {
+    if (!psnState) psnState = { trackers: [], systems: [], relay: {} };
+    psnNotice = notice(error.message, "error");
+  }
+  const holder = $("psn");
+  const active = document.activeElement;
+  if (holder && !(active && holder.contains(active) && active.tagName === "INPUT")) put(holder, psnPanel());
+  else if ($("psn-trackers")) put($("psn-trackers"), psnTrackers());
+  if (!$("view-connections").hidden && psnState.on) psnTimer = setTimeout(loadPsn, 1000);
+}
+
+function psnTrackers() {
+  const p = psnState;
+  if (!p.running) return [];
+  if (!p.trackers.length) return el("p", { class: "help" }, "No trackers heard yet.");
+  const metre = (value) => value.toFixed(2);
+  return [
+    p.systems.length ? el("p", { class: "muted" }, `From ${p.systems.map((system) => `${system.name || "a tracking system"} (${system.address})`).join(", ")}.`) : null,
+    el("div", { class: "tablewrap" }, el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Tracker"), el("th", {}, "Name"), el("th", { class: "num" }, "X (m)"), el("th", { class: "num" }, "Y (m)"),
+        el("th", { class: "num" }, "Z (m)"), el("th", { class: "num" }, "Rate"), el("th", {}, "From"))),
+      // Shown as the stage has it: X toward stage left, Y upstage, Z up (PSN's own order is right, up, depth).
+      el("tbody", {}, p.trackers.map((t) => el("tr", {}, el("td", { class: "num" }, String(t.id)), el("td", {}, t.name || "—"),
+        el("td", { class: "num" }, metre(t.position[0])), el("td", { class: "num" }, metre(t.position[2])), el("td", { class: "num" }, metre(t.position[1])),
+        el("td", { class: "num" }, `${t.rate}/s`), el("td", {}, t.source))))))];
+}
+
+function psnPanel() {
+  if (!psnState) return el("p", { class: "muted" }, "Loading…");
+  const p = psnState;
+  const group = el("input", { type: "text", class: "mid", value: p.group, placeholder: "This computer only", "aria-label": "PosiStageNet multicast group",
+    onchange: (event) => loadPsn({ psn_group: event.target.value.trim() }) });
+  const port = el("input", { type: "number", class: "narrow", min: "1024", max: "65535", step: "1", value: String(p.port || 56565), "aria-label": "PosiStageNet port",
+    onchange: (event) => loadPsn({ psn_port: Number(event.target.value) }) });
+  const relay = p.relay || {};
+  const status = !p.on ? null
+    : p.running ? notice(`Listening on ${p.group ? `${p.group}, ` : ""}port ${p.port}, on the DMX network (${relay.address}).`, "ok")
+    : !relay.enabled ? notice("PosiStageNet comes through Openviz's DMX receiver, which is off in this copy of Openviz.", "")
+    : !relay.possible ? notice("PosiStageNet comes through Openviz's DMX receiver, which does not run while Art-Net is received on 127.0.0.1. Choose the lighting network's address under DMX Input.", "")
+    : relay.error ? notice(relay.error, "error") : notice("Starting…", "");
+  return [
+    el("div", { class: "group" },
+      setting("Receive PosiStageNet", "Set pieces given a tracker number (a show's Set Pieces tab) follow where a tracking system says that tracker is, while a show is watched. Heard on the network chosen under DMX Input.",
+        el("button", { class: "switch", role: "switch", "aria-checked": String(!!p.on), "aria-label": "Receive PosiStageNet", onclick: () => loadPsn({ psn: !p.on }) })),
+      setting("Multicast Group", "236.10.10.10 unless the tracking system is set otherwise. Empty: only what is sent to this computer's own address.", group),
+      setting("Port", "56565 unless the tracking system is set otherwise.", port)),
+    psnNotice, status,
+    el("div", { id: "psn-trackers" }, psnTrackers()),
+  ];
+}
+
 function renderConnections() {
   put($("connections"),
-    pageHead("Connections", "Exchange rigs with your console, and control the visualizer remotely."),
+    pageHead("Connections", "Exchange rigs with your console, control the visualizer remotely, and follow a tracking system."),
     el("div", { class: "page-notice" }),
     el("div", { id: "xchange" }, el("p", { class: "muted" }, "Loading…")),
     el("h2", {}, "OSC Remote Control"),
-    el("div", { id: "osc" }, oscPanel()));
+    el("div", { id: "osc" }, oscPanel()),
+    el("h2", {}, "PosiStageNet Tracking"),
+    el("div", { id: "psn" }, psnPanel()));
   xchangeShown = "";
   if (xchange) renderXchange();
   loadXchange();
   loadOsc();
+  loadPsn();
 }
 
 // --------------------------------------------------------------------------------- visualizer
@@ -2222,7 +2676,16 @@ function renderVisualizer() {
       setting("Hazers in the Rig", "Fog and haze machines patched in the rig add to the haze as the console drives them, building over about 15 seconds and clearing over a minute.",
         toggle("rig_haze", "Hazers in the rig", renderVisualizer)),
       setting("Work Light", "An even light on the stage and fixtures, so the rig is visible when nothing is lit. Does not light the haze.",
-        slider("house_lights", 0, 1, 0.05, (value) => value ? `${Math.round(value * 100)}%` : "Off", renderVisualizer))),
+        slider("house_lights", 0, 1, 0.05, (value) => value ? `${Math.round(value * 100)}%` : "Off", renderVisualizer)),
+      setting("Floor Finish", "A gloss floor shows the lit stage and the fixtures' lenses in it, as a polished or wet stage does. Beams in haze are not reflected.",
+        choice("floor", [[0.8, "Matte"], [0.45, "Satin"], [0.15, "Gloss"]], renderVisualizer)),
+      setting("Floor Colour", "Most stage floors are black or dark grey; a lighter floor gives back more light.", choice("floor_shade", [[0.02, "Black"], [0.14, "Dark Grey"], [0.35, "Grey"], [0.7, "White"]], renderVisualizer))),
+    el("h2", {}, "Lens"),
+    el("div", { class: "group" },
+      setting("Glow", "How far bright lenses and hot spots glow into the picture around them, as they do on a camera.",
+        choice("bloom", [[0, "Off"], [0.3, "Low"], [0.675, "Normal"], [1.5, "High"]], renderVisualizer)),
+      setting("Motion Blur", "Fast movement, of the camera or of beams, is blurred along its path, as on video. Off gives sharper single frames.",
+        toggle("motion_blur", "Motion blur", renderVisualizer))),
     el("h2", {}, "Camera and Controls"),
     el("div", { class: "group" },
       setting("Mouse Look", "Hold Right Button keeps the pointer free and turns the view only while the right button is held, as in the Unreal Editor. Always hides the pointer, as in games. Tab switches while watching.",
@@ -2250,6 +2713,8 @@ function renderVisualizer() {
       setting("Beam Shadows", "Truss, set pieces and screens cut the beams passing through them. Costs frame rate only for beams with something in them.",
         toggle("beam_shadows", "Beam shadows", renderVisualizer)),
       setting("Surface Shadows", "Every beam casts shadows on the floor and set. Costs frame rate.", toggle("shadows", "Surface shadows", renderVisualizer)),
+      setting("Colour Gobos on Surfaces", "Coloured gobos and split colours land on the floor and set in colour; otherwise they show in colour in the haze and only as brightness on surfaces. Costs some frame rate. Applies the next time the visualizer opens; the first time, Unreal may prepare its shaders for a few minutes.",
+        toggle("surface_colour", "Colour gobos on surfaces", renderVisualizer)),
       setting("MegaLights", `Unreal's renderer for many lights at once; much faster with large rigs. ${onMac() ? "Experimental on macOS." : "Experimental in Unreal 5.8."}`, toggle("megalights", "MegaLights", renderVisualizer)),
       setting("Preview Fixture Count", "How many fixtures a fixture preview hangs in a row.",
         slider("preview_count", 1, 24, 1, (value) => String(value), renderVisualizer))));
@@ -2363,8 +2828,13 @@ function renderRun(run) {
     ? `Frame ${run.progress[0].toLocaleString()} of ${run.progress[1].toLocaleString()} (${Math.round(100 * run.progress[0] / Math.max(run.progress[1], 1))}%). The window closes by itself at the end.`
     : "The first look is held for two seconds while the fixtures settle, then the movie begins."));
   for (const video of run.videos || []) {
-    lines.push(el("div", { class: video.error ? "note" : "" }, video.state === "converting" ? `Converting ${video.file} to MP4…` : `Video saved: ${video.file}. ${video.error || ""}`,
-      video.state === "converting" ? null : [" ", revealButton("videos", "Show Videos")]));
+    const working = video.state === "converting" || video.state === "adding sound";
+    lines.push(el("div", { class: video.error ? "note" : "" }, video.state === "adding sound" ? `Adding the sound to ${video.file}…` : working ? `Converting ${video.file} to MP4…` : `Video saved: ${video.file}. ${video.error || ""}`,
+      working ? null : [" ", revealButton("videos", "Show Videos")]));
+  }
+  for (const round of run.panoramas || []) {
+    lines.push(el("div", { class: round.error ? "note" : "" }, round.state === "stitching" ? "Making the 360° picture…" : round.error || `360° picture saved: ${round.file}.`,
+      round.state === "stitching" ? null : [" ", revealButton("pictures", "Show Pictures")]));
   }
   if (run.running && !run.editor && !run.rendering && run.lines.length) lines.push(el("div", { class: "faint" }, "W A S D move · Q/E down/up · Shift faster · 1–9 recall a view, hold to store · 0 start · P picture · T, F, L plan, front and side views."));
   if (run.running && run.editor && run.lines.length) lines.push(el("div", { class: "faint" }, "Select a fixture and press W to move or E to rotate it. Universe, address and mode are in the Details panel under Openviz. Edits save automatically."));
@@ -2388,7 +2858,14 @@ function renderRun(run) {
       [1, 2, 3, 4, 5, 6, 7, 8, 9].filter((number) => stored.has(number)).map((number) => ask("view", String(number), String(number))), keep,
       el("span", { class: "label" }, "Ortho"), ask("view", "top", "Plan"), ask("view", "front", "Front"), ask("view", "side", "Side"),
       el("span", { class: "label" }, "Picture"), ask("picture", "", "Screen Size"), ask("picture", "3840x2160", "4K"), ask("picture", "7680x4320", "8K"),
+      el("span", { title: "A 360-degree picture from where the camera stands, to look round in a photo viewer or a headset" }, ask("panorama", "8192", "360°")),
       el("button", { class: "small subtle", onclick: () => reveal("pictures") }, icon("folder")),
+      el("span", { class: "label" }, "Light"), el("button", { class: run.metering ? "small primary" : "small",
+        title: "Light levels in lux on the floor and what stands on it, from the beams as they are now, in false colour; the reading under the pointer is shown in the visualizer. The M key does the same.",
+        onclick: async () => {
+          try { await api("/api/visualizer", { json: { command: "meter", value: run.metering ? "off" : "on" } }); said.textContent = ""; }
+          catch (error) { said.textContent = ` ${error.message}`; }
+        } }, run.metering ? "Hide Lux" : "Lux Levels"),
       el("span", { class: "label" }, "Video"), run.filming
         ? el("button", { class: "small primary", onclick: async () => { await api("/api/visualizer", { json: { command: "record", value: "stop" } }).catch(() => null); } }, icon("stop"), "Stop")
         : ask("record", "start", [icon("record"), "Record"]),
@@ -2424,6 +2901,7 @@ async function start() {
   $("remember-words").textContent = `Stay signed in on ${thisComputer()}`;
   $("remember-where").textContent = passwordStore();
   $("reveal-fixtures").replaceChildren(icon("folder"), showInFolder());
+  $("build-fixture").replaceChildren(icon("plus"), "New Fixture Type");
   // With a window of its own (Windows), Openviz ends when the page has gone: this says it has not.
   setInterval(() => { api("/api/here").catch(() => {}); }, 30000);
   $("engine-dot").classList.toggle("off", !!ready());
@@ -2458,6 +2936,10 @@ async function start() {
   $("q").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(search, 180); });
   $("login").addEventListener("submit", login);
   $("reveal-fixtures").addEventListener("click", () => reveal("fixtures"));
+  $("build-fixture").addEventListener("click", () => builderDialog({ done: (answer) => {
+    pageNotice().replaceChildren(notice(`${typeName(answer.file)} is saved in your fixture library. Add it to a show from the show's Patch tab, or use it to replace a placeholder under Fixture Types.`, "ok"));
+    loadLibrary();
+  } }));
 
   try { route = Object.assign(route, JSON.parse(sessionStorage.getItem("route") || "{}")); } catch (error) { /* fine */ }
   go(route.view, route);

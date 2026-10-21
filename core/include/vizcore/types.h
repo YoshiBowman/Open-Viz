@@ -98,4 +98,15 @@ VIZCORE_API bool invert(const Transform& transform, Transform& out);
 VIZCORE_API void turn_angles(const Transform& transform, double degrees[3]);
 VIZCORE_API void set_turn_angles(Transform& transform, const double degrees[3]);
 
+// How a dimmer channel's level becomes light. A file's dimmer runs straight from dark to full;
+// a dimmer rack, or a console's profile, often bends that: "square" (square law: half the level
+// gives a quarter of the light, as many racks do for incandescent lamps), "inverse-square" (the
+// other way: brighter low down), "s-curve" (gentle at both ends). A type in a show can be given one.
+enum class DimmerCurve { Linear, Square, InverseSquare, SCurve };
+// The light (0 to 1) for a level (0 to 1) under the curve.
+VIZCORE_API double dimmer_curve(DimmerCurve curve, double level);
+// "linear", "square", "inverse-square", "s-curve", as the types file and the inspector write them.
+VIZCORE_API const char* dimmer_curve_name(DimmerCurve curve);
+VIZCORE_API bool parse_dimmer_curve(std::string_view name, DimmerCurve& out);
+
 }  // namespace viz

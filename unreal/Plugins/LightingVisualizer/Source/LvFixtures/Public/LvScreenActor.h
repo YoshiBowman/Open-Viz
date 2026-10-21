@@ -76,6 +76,14 @@ public:
 	FVector4 GetPart() const { return Part; }
 
 	/**
+	 * Or a part that is not upright in the picture: its top left corner in the picture, and the
+	 * picture's movement across the screen's width and down its height, as shares of the whole
+	 * (FLvScreenSetting::Map). bOn false goes back to Part.
+	 */
+	void SetMap(bool bOn, const double InMap[6]);
+	bool HasMap(bool bOn, const double InMap[6]) const;
+
+	/**
 	 * How its picture is doing, in words for the log: what it shows, or why it does not. A film or
 	 * a stream takes a moment to open, so this changes after Show.
 	 */
@@ -134,6 +142,8 @@ private:
 	void GiveFeedBack();
 
 	FVector4 Part = FVector4(0.0, 0.0, 1.0, 1.0);
+	bool bTurnedPart = false;
+	double TurnedPart[6] = {0.0, 0.0, 1.0, 0.0, 0.0, 1.0};
 	bool bStops = false;    // whether its own rectangle is what stops beams
 
 	/** Why the picture asked for is not up, if it is not. */

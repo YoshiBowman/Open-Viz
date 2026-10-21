@@ -72,6 +72,40 @@ void tube(Mesh& mesh, Vec from, Vec to, double thickness) {
     prism(mesh, near, far);
 }
 
+// A round tube of that diameter from one point to another, as many sided as a pipe needs to look round at stage distances.
+void rod(Mesh& mesh, Vec from, Vec to, double diameter, int sides = 12) {
+    const Vec along = unit(to - from);
+    const Vec aside = unit(cross(along, std::fabs(along.z) > 0.9 ? Vec{1, 0, 0} : Vec{0, 0, 1}));
+    const Vec up = cross(aside, along);
+    const double r = diameter * 0.5;
+    const double step = 2.0 * 3.14159265358979323846 / sides;
+    for (int k = 0; k < sides; ++k) {
+        // Each side a flat strip: anticlockwise seen from outside.
+        const Vec a = aside * (r * std::cos(step * k)) + up * (r * std::sin(step * k));
+        const Vec b = aside * (r * std::cos(step * (k + 1))) + up * (r * std::sin(step * (k + 1)));
+        face(mesh, from + b, from + a, to + a, to + b);
+    }
+    // The two ends, as fans about their middles.
+    for (int end = 0; end < 2; ++end) {
+        const Vec middle = end == 0 ? from : to;
+        const Vec normal = end == 0 ? along * -1.0 : along;
+        const uint32_t first = static_cast<uint32_t>(mesh.vertex_count());
+        for (int k = 0; k < sides; ++k) {
+            const Vec at = middle + aside * (r * std::cos(step * k)) + up * (r * std::sin(step * k));
+            mesh.positions.insert(mesh.positions.end(), {static_cast<float>(at.x), static_cast<float>(at.y), static_cast<float>(at.z)});
+            mesh.normals.insert(mesh.normals.end(), {static_cast<float>(normal.x), static_cast<float>(normal.y), static_cast<float>(normal.z)});
+        }
+        for (int k = 1; k + 1 < sides; ++k) {
+            // The ring runs anticlockwise seen from before `from`: so the near end in its order, the far end against it.
+            if (end == 0) {
+                mesh.triangles.insert(mesh.triangles.end(), {first, first + static_cast<uint32_t>(k), first + static_cast<uint32_t>(k + 1)});
+            } else {
+                mesh.triangles.insert(mesh.triangles.end(), {first, first + static_cast<uint32_t>(k + 1), first + static_cast<uint32_t>(k)});
+            }
+        }
+    }
+}
+
 double held(double value, double low, double high, double otherwise) {
     if (!(value == value)) return otherwise;    // not a number
     return std::min(std::max(value, low), high);
@@ -109,6 +143,31 @@ void truss(Mesh& mesh, double length_m, double side) {
         for (int k = 0; k < 4; ++k) {
             const Vec a = corners[k], c = corners[(k + 1) % 4];
             tube(mesh, {x, a.y, a.z}, {x, c.y, c.z}, brace);    // the frame at the bay's end
+            if (b < bays) {
+                const bool lean = (b + k) % 2 == 0;
+                tube(mesh, {lean ? x : x + bay, a.y, a.z}, {lean ? x + bay : x, c.y, c.z}, brace);
+            }
+        }
+    }
+}
+
+// Triangle truss along X: two bottom chords and one at the apex, a triangular frame at every bay's
+// end and a diagonal on each of its three sides. `side` is its width over the bottom chords.
+void triangle(Mesh& mesh, double length_m, double side) {
+    const double chord = std::min(std::max(side * 0.17, 0.02), 0.06);
+    const double brace = chord * 0.45;
+    const double reach = (side - chord) * 0.5;
+    const double rise = reach * std::sqrt(3.0);    // an equilateral triangle between the chords' middles
+    const Vec corners[3] = {{0, -reach, chord * 0.5}, {0, reach, chord * 0.5}, {0, 0, chord * 0.5 + rise}};
+    const double half = length_m * 0.5;
+    for (const Vec& corner : corners) rod(mesh, {-half, corner.y, corner.z}, {half, corner.y, corner.z}, chord, 8);
+    const int bays = std::max(1, std::min(static_cast<int>(std::lround(length_m / side)), 400));
+    const double bay = (length_m - chord) / bays;
+    for (int b = 0; b <= bays; ++b) {
+        const double x = -half + chord * 0.5 + bay * b;
+        for (int k = 0; k < 3; ++k) {
+            const Vec a = corners[k], c = corners[(k + 1) % 3];
+            tube(mesh, {x, a.y, a.z}, {x, c.y, c.z}, brace);
             if (b < bays) {
                 const bool lean = (b + k) % 2 == 0;
                 tube(mesh, {lean ? x : x + bay, a.y, a.z}, {lean ? x + bay : x, c.y, c.z}, brace);
@@ -167,10 +226,43 @@ void person(Mesh& mesh, double tall) {
     box(mesh, {-0.065 * h, -0.075 * h, 0.87 * h}, {0.065 * h, 0.065 * h, h});                  // head, its face a little forward
 }
 
+// An audience standing in a field `width` across and `depth` deep, about one and a half people to a
+// square metre, set out in rows with a little give, each as tall as `tall` give or take a tenth,
+// some with their hands up. The same field always gives the same crowd.
+void crowd(Mesh& mesh, double width, double depth, double tall) {
+    uint32_t seed = 0x9E3779B9u;
+    auto next = [&seed]() {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        return static_cast<double>(seed & 0xFFFFFF) / static_cast<double>(0x1000000);
+    };
+    const double spacing = 0.8;    // about 1.5 to a square metre
+    const int across = std::max(1, std::min(static_cast<int>(width / spacing), 200));
+    const int rows = std::max(1, std::min(static_cast<int>(depth / spacing), 200));
+    for (int row = 0; row < rows; ++row) {
+        for (int k = 0; k < across; ++k) {
+            const double x = -width * 0.5 + (k + 0.5 + (next() - 0.5) * 0.6 + (row % 2) * 0.5) * width / (across + 0.5);
+            const double y = -depth * 0.5 + (row + 0.5 + (next() - 0.5) * 0.5) * depth / rows;
+            const double h = tall * (0.9 + 0.2 * next());
+            Mesh one;
+            person(one, h);
+            if (next() < 0.25) {
+                // Hands up: the arms raised above the shoulders.
+                box(one, {-0.13 * h - 0.06 * h, -0.035 * h, 0.82 * h}, {-0.13 * h, 0.035 * h, 1.12 * h});
+                box(one, {0.13 * h, -0.035 * h, 0.82 * h}, {0.13 * h + 0.06 * h, 0.035 * h, 1.12 * h});
+            }
+            // Facing the stage, which is upstage of them (+Y), more or less.
+            append_turned(mesh, one, 3.14159265358979323846 + (next() - 0.5) * 0.6, {x, y, 0});
+        }
+    }
+}
+
 }  // namespace
 
 bool is_piece_kind(std::string_view kind) {
-    return kind == "deck" || kind == "drape" || kind == "truss" || kind == "box" || kind == "person" || kind == "circle" || kind == "corner" || kind == "model";
+    return kind == "deck" || kind == "drape" || kind == "truss" || kind == "box" || kind == "person" || kind == "circle" || kind == "corner" || kind == "model" ||
+           kind == "triangle" || kind == "pipe" || kind == "boom" || kind == "crowd" || kind == "stairs";
 }
 
 SetPiece default_piece(std::string_view kind) {
@@ -195,6 +287,21 @@ SetPiece default_piece(std::string_view kind) {
     } else if (piece.kind == "corner") {    // a corner of 29 cm box truss, two metre arms
         piece.width = 2.0, piece.depth = 0.29, piece.height = 0.29;
         shade(0.45f);
+    } else if (piece.kind == "triangle") {    // eight metres of 29 cm triangle truss
+        piece.width = 8.0, piece.depth = 0.29, piece.height = 0.29;
+        shade(0.45f);
+    } else if (piece.kind == "pipe") {    // a ten metre bar of 48 mm pipe, as theatres fly
+        piece.width = 10.0, piece.depth = 0.048, piece.height = 0.048;
+        shade(0.04f);
+    } else if (piece.kind == "boom") {    // a 3 m upright of 48 mm pipe on a base plate 45 cm square
+        piece.width = 0.45, piece.depth = 0.048, piece.height = 3.0;
+        shade(0.04f);
+    } else if (piece.kind == "crowd") {    // an audience twelve metres across and eight deep
+        piece.width = 12.0, piece.depth = 8.0, piece.height = 1.75;
+        shade(0.12f);
+    } else if (piece.kind == "stairs") {    // up onto a 60 cm riser: a metre and twenty wide, four steps
+        piece.width = 1.2, piece.depth = 1.2, piece.height = 0.6;
+        shade(0.03f);
     } else {
         piece.width = 1.0, piece.depth = 1.0, piece.height = 1.0;
         shade(0.08f);
@@ -216,8 +323,29 @@ Mesh piece_mesh(const SetPiece& piece) {
         circle(mesh, std::max(width, 1.0), std::min(depth, 2.0));
     } else if (piece.kind == "corner") {
         corner(mesh, width, std::min(depth, 2.0));
+    } else if (piece.kind == "crowd") {
+        crowd(mesh, std::min(width, 160.0), std::min(depth, 160.0), std::min(height, 2.5));
+    } else if (piece.kind == "triangle") {
+        triangle(mesh, width, std::min(depth, 2.0));
+    } else if (piece.kind == "pipe") {
+        // Lying along X with its underside at its foot: what hangs on it hangs from there.
+        const double across = std::min(depth, 0.5);
+        rod(mesh, {-width * 0.5, 0, across * 0.5}, {width * 0.5, 0, across * 0.5}, across, 12);
+    } else if (piece.kind == "boom") {
+        // Standing on a base plate `width` square, one centimetre thick.
+        const double plate = std::min(width, 3.0);
+        box(mesh, {-plate * 0.5, -plate * 0.5, 0}, {plate * 0.5, plate * 0.5, 0.01});
+        rod(mesh, {0, 0, 0.01}, {0, 0, std::max(height, 0.02)}, std::min(depth, 0.5), 12);
     } else if (piece.kind == "drape") {
         box(mesh, {-width * 0.5, -0.02, 0}, {width * 0.5, 0.02, height});
+    } else if (piece.kind == "stairs") {
+        // Solid steps from the floor, each a little higher, the top one at `height` and at its +Y end:
+        // set in front of a deck as tall, they climb onto it.
+        const int steps = std::clamp(static_cast<int>(std::lround(height / 0.18)), 1, 60);
+        const double tread = depth / steps;
+        for (int k = 0; k < steps; ++k) {
+            box(mesh, {-width * 0.5, -depth * 0.5 + k * tread, 0}, {width * 0.5, -depth * 0.5 + (k + 1) * tread, height * (k + 1) / steps});
+        }
     } else {
         box(mesh, {-width * 0.5, -depth * 0.5, 0}, {width * 0.5, depth * 0.5, height});
     }
@@ -304,6 +432,8 @@ std::vector<PlacedPiece> parse_pieces(std::string_view text) {
                 usable = false;
             }
         }
+        placed.tracker = static_cast<int>(number("tracker", 0.0, 0.0, 65535.0));
+        if (const json::Value* follow = entry.get("follow_height")) placed.follow_height = follow->type == json::Value::Type::Bool && follow->boolean;
         if (!usable) continue;
         placed.world = piece_place(x, y, z, turn);
         out.push_back(std::move(placed));

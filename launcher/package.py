@@ -32,7 +32,7 @@ FORMAT = "Openviz show package"
 VERSION = 1
 MANIFEST = "openviz-package.json"
 EXTENSION = ".openviz"
-SIDE_ENDINGS = (".edits.xml", ".types.xml", ".pieces.json", ".screens.json", ".hidden.json", ".views.txt", ".paper.json")
+SIDE_ENDINGS = (".edits.xml", ".types.xml", ".pieces.json", ".screens.json", ".hidden.json", ".views.txt", ".paper.json", ".groups.json")
 
 
 class PackageError(Exception):

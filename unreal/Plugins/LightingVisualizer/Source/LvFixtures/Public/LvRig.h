@@ -96,6 +96,13 @@ struct LVFIXTURES_API FLvScreenSetting
 	/** The part of its picture it shows: left, top, right, bottom, as shares of the whole. */
 	FVector4 Part = FVector4(0.0, 0.0, 1.0, 1.0);
 	/**
+	 * Or a part that need not be upright in the picture (an LED processor's map lays panels out
+	 * turned): where in the picture its top left corner is, and how far the picture moves across
+	 * its width and down its height, as shares of the whole: ox, oy, ux, uy, vx, vy. Used instead of Part.
+	 */
+	bool bMap = false;
+	double Map[6] = {0.0, 0.0, 1.0, 0.0, 0.0, 1.0};
+	/**
 	 * A screen split into a grid has Columns x Rows sections, row by row from the top left, and
 	 * shows nothing itself. Otherwise all three are empty.
 	 */
@@ -132,6 +139,9 @@ struct LVFIXTURES_API FLvPieceSetting
 	FString Up;
 	/** A drape, box or deck: a picture on its side toward the house (the whole path), or empty. */
 	FString Picture;
+	/** A PosiStageNet tracker it follows while a show is watched, 0 for none; and whether its height too, or only across the floor. */
+	int32 Tracker = 0;
+	bool bFollowHeight = false;
 };
 
 /** The id of a section's own screen: the screen's id, "#", and the section's number from 1. */

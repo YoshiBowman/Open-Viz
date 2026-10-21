@@ -63,11 +63,11 @@ class Writer:
         self._out = open(path + ".part", "wb")
         self._out.write(MAGIC)
 
-    def write(self, now, universe, levels):
+    def write(self, now, universe, levels, force=False):
         if not 0 < universe <= 0x7FFF or self._out is None:
             return
         last = self._last.get(universe)
-        if last and last[0] == levels and now - last[1] < KEEP_ALIVE:
+        if last and last[0] == levels and now - last[1] < KEEP_ALIVE and not force:
             return    # nothing new on this universe
         self._out.write(RECORD.pack(now, universe, len(levels)) + levels)
         self._last[universe] = (levels, now)
@@ -143,6 +143,38 @@ def read(path):
             if len(levels) < count or count > 512 or not at >= 0.0:
                 return
             yield at, universe, levels
+
+
+def trim(source, target, start, end):
+    """Writes the part of a recording from `start` to `end` seconds as a recording of its own,
+    beginning with every universe as it stood at `start`. Returns its summary."""
+    if not 0.0 <= start < end:
+        raise ValueError("the part must start before it ends, at 0 seconds or later")
+    standing = {}    # universe -> its levels at the latest record before `start`
+    writer = Writer(target)
+    begun = False
+    try:
+        for at, universe, levels in read(source):
+            if at < start:
+                standing[universe] = levels
+                continue
+            if at > end:
+                break
+            if not begun:
+                for held, held_levels in sorted(standing.items()):
+                    writer.write(0.0, held, held_levels)
+                begun = True
+            writer.write(at - start, universe, levels)
+        if not begun:
+            for held, held_levels in sorted(standing.items()):
+                writer.write(0.0, held, held_levels)
+        # The last look is held to the end of the part, so that the part lasts as long as asked.
+        for held, (held_levels, written) in sorted(writer._last.items()):
+            if written < end - start:
+                writer.write(end - start, held, held_levels, force=True)
+    finally:
+        writer.close()
+    return summary(target)
 
 
 def summary(path):

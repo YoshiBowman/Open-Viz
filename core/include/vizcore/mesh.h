@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -109,6 +110,13 @@ struct Bounds {
 // shape (cube, cylinder, sphere) or a part that turns is centred on its origin, the rest hang
 // below theirs, as the visualizer draws them.
 VIZCORE_API Bounds fixture_bounds(const FixtureType& fixture, std::string_view root_geometry, const Archive* gdtf);
+
+// The points that outline a fixture at rest, as seen from above, from the front and from the
+// side, in the same coordinates as fixture_bounds: those of every part's shape that lie on its
+// outline in one of the three views (each a rubber band round the shape as it looks from there),
+// so that a drawing can show the fixture's real outline rather than its box. Parts are measured as
+// fixture_bounds measures them. Empty where no part states a size.
+VIZCORE_API std::vector<std::array<double, 3>> fixture_outline_points(const FixtureType& fixture, std::string_view root_geometry, const Archive* gdtf);
 
 // The mesh of a model file in an MVR, as a Geometry3D names it: 3DS or binary glTF, told apart by
 // the name's ending, at the size the file has it (there is nothing to fit it to).

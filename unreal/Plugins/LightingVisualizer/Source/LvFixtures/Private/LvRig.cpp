@@ -199,8 +199,10 @@ namespace
 		}
 		const bool bTypePan = Wanted.invert_pan != Wanted.own_invert_pan;
 		const bool bTypeTilt = Wanted.invert_tilt != Wanted.own_invert_tilt;
+		const uint8 Curve = static_cast<uint8>(Wanted.dimmer);
 		bChanged = bChanged || Fixture.bInvertPan != Wanted.own_invert_pan || Fixture.bInvertTilt != Wanted.own_invert_tilt || Fixture.bTypeInvertPan != bTypePan ||
-			Fixture.bTypeInvertTilt != bTypeTilt || Fixture.PanOffset != Wanted.pan_offset || Fixture.TiltOffset != Wanted.tilt_offset;
+			Fixture.bTypeInvertTilt != bTypeTilt || Fixture.PanOffset != Wanted.pan_offset || Fixture.TiltOffset != Wanted.tilt_offset || Fixture.TypeDimmerCurve != Curve;
+		Fixture.TypeDimmerCurve = Curve;
 		Fixture.bInvertPan = Wanted.own_invert_pan;
 		Fixture.bInvertTilt = Wanted.own_invert_tilt;
 		Fixture.bTypeInvertPan = bTypePan;
@@ -648,6 +650,7 @@ TArray<ALvScreenActor*> LvRig::SpawnScreens(UWorld& World, const FString& MvrPat
 		{
 			Whole.Show(Setting.Source, Setting.Value, Setting.Nits);
 			Whole.SetPart(Setting.Part);
+			Whole.SetMap(Setting.bMap, Setting.Map);
 			return Pieces;
 		}
 		Whole.Show(TEXT("sections"), FString(), 0.0f);

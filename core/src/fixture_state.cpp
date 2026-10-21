@@ -1,6 +1,7 @@
 #include "vizcore/fixture_state.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <string>
 #include <string_view>
@@ -33,6 +34,15 @@ bool starts_with(std::string_view text, std::string_view prefix) {
 
 // True if `text` is `prefix`, one or more digits, then anything; `rest` gets the "anything" and
 // `number` what the digits say.
+// Whether a name says a shutter is open (1) or closed (-1); 0 when it says neither, or both ("Close/Open").
+int open_or_closed(std::string_view name) {
+    std::string lower(name);
+    for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const bool open = lower.find("open") != std::string::npos;
+    const bool closed = lower.find("close") != std::string::npos || lower.find("blackout") != std::string::npos;
+    return open == closed ? 0 : open ? 1 : -1;
+}
+
 bool numbered(std::string_view text, std::string_view prefix, int& number, std::string_view& rest) {
     if (!starts_with(text, prefix)) return false;
     size_t i = prefix.size();
@@ -160,8 +170,16 @@ FixtureModel::FixtureModel(const FixtureType& fixture, size_t mode_index)
                     entry.component = attribute[4] - 'X';
                 } else if (attribute == "Dimmer") {
                     entry.kind = Kind::Dimmer;
-                } else if (attribute == "Fog" || attribute == "Haze") {
+                } else if ((numbered(attribute, "Fog", number, rest) && rest.empty()) || (numbered(attribute, "Haze", number, rest) && rest.empty()) ||
+                           attribute == "Fog" || attribute == "Haze") {
+                    // "Fog", "Haze", and numbered as GDTF numbers them ("Haze1": MDG's ATMe has its output level so).
                     entry.kind = Kind::Fog;
+                    entry.on_off = !function.channel_sets.empty();
+                    for (const ChannelSet& set : function.channel_sets) {
+                        const bool fixed = set.physical_from && set.physical_to && *set.physical_from == *set.physical_to &&
+                                           (*set.physical_from == 0.0 || *set.physical_from == 1.0);
+                        entry.on_off = entry.on_off && fixed;
+                    }
                     if (!info.is_virtual) has_fog_ = true;
                 } else if (attribute == "Zoom") {
                     entry.kind = Kind::Zoom;
@@ -598,7 +616,92 @@ std::vector<RestBeam> rest_beams(const FixtureType& fixture, size_t mode_index) 
     return out;
 }
 
-void FixtureModel::resolve(const std::vector<ChannelValue>& values, FixtureState& out) const {
+bool aim_at(Transform& world, const std::vector<RestBeam>& beams, const double target[3]) {
+    if (beams.empty()) return false;
+    double centre[3] = {0, 0, 0}, along[3] = {0, 0, 0};
+    for (const RestBeam& beam : beams) {
+        for (int k = 0; k < 3; ++k) {
+            centre[k] += beam.world.m[k][3] * 1000.0 / static_cast<double>(beams.size());    // metres to the placing's millimetres
+            along[k] -= beam.world.m[k][2];                                                  // a beam shines along its own -Z
+        }
+    }
+    auto unit = [](double v[3]) {
+        const double length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (length < 1e-12) return false;
+        for (int k = 0; k < 3; ++k) v[k] /= length;
+        return true;
+    };
+    if (!unit(along)) return false;
+    Transform turned = world;
+    // The lens moves as the fixture turns about its origin, so the turn is found again from where it now is.
+    for (int pass = 0; pass < 6; ++pass) {
+        double lens[3], now[3], wanted[3];
+        for (int k = 0; k < 3; ++k) {
+            lens[k] = turned.o[k] + centre[0] * turned.u[k] + centre[1] * turned.v[k] + centre[2] * turned.w[k];
+            now[k] = along[0] * turned.u[k] + along[1] * turned.v[k] + along[2] * turned.w[k];
+            wanted[k] = target[k] - lens[k];
+        }
+        if (std::sqrt(wanted[0] * wanted[0] + wanted[1] * wanted[1] + wanted[2] * wanted[2]) < 1.0) return false;    // within a millimetre
+        if (!unit(now) || !unit(wanted)) return false;
+        double axis[3] = {now[1] * wanted[2] - now[2] * wanted[1], now[2] * wanted[0] - now[0] * wanted[2], now[0] * wanted[1] - now[1] * wanted[0]};
+        const double cosine = now[0] * wanted[0] + now[1] * wanted[1] + now[2] * wanted[2];
+        double sine = std::sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+        if (sine < 1e-12) {
+            if (cosine > 0.0) break;    // already there
+            // Straight away from it: half a turn about any line across the beam.
+            const double across[3] = {std::fabs(now[0]) < 0.9 ? 1.0 : 0.0, std::fabs(now[0]) < 0.9 ? 0.0 : 1.0, 0.0};
+            axis[0] = now[1] * across[2] - now[2] * across[1];
+            axis[1] = now[2] * across[0] - now[0] * across[2];
+            axis[2] = now[0] * across[1] - now[1] * across[0];
+            sine = 0.0;
+        }
+        unit(axis);
+        // Rodrigues: v' = v cos + (axis x v) sin + axis (axis . v)(1 - cos).
+        auto turn = [&](double v[3]) {
+            const double cross[3] = {axis[1] * v[2] - axis[2] * v[1], axis[2] * v[0] - axis[0] * v[2], axis[0] * v[1] - axis[1] * v[0]};
+            const double dot = axis[0] * v[0] + axis[1] * v[1] + axis[2] * v[2];
+            for (int k = 0; k < 3; ++k) v[k] = v[k] * cosine + cross[k] * sine + axis[k] * dot * (1.0 - cosine);
+        };
+        turn(turned.u);
+        turn(turned.v);
+        turn(turned.w);
+    }
+    world = turned;
+    return true;
+}
+
+double dimmer_curve(DimmerCurve curve, double level) {
+    const double x = level < 0.0 ? 0.0 : (level > 1.0 ? 1.0 : level);
+    switch (curve) {
+        case DimmerCurve::Square: return x * x;
+        case DimmerCurve::InverseSquare: return std::sqrt(x);
+        case DimmerCurve::SCurve: return x * x * (3.0 - 2.0 * x);
+        case DimmerCurve::Linear: break;
+    }
+    return x;
+}
+
+const char* dimmer_curve_name(DimmerCurve curve) {
+    switch (curve) {
+        case DimmerCurve::Square: return "square";
+        case DimmerCurve::InverseSquare: return "inverse-square";
+        case DimmerCurve::SCurve: return "s-curve";
+        case DimmerCurve::Linear: break;
+    }
+    return "linear";
+}
+
+bool parse_dimmer_curve(std::string_view name, DimmerCurve& out) {
+    for (DimmerCurve curve : {DimmerCurve::Linear, DimmerCurve::Square, DimmerCurve::InverseSquare, DimmerCurve::SCurve}) {
+        if (name == dimmer_curve_name(curve)) {
+            out = curve;
+            return true;
+        }
+    }
+    return false;
+}
+
+void FixtureModel::resolve(const std::vector<ChannelValue>& values, FixtureState& out, DimmerCurve curve) const {
     out.axes.resize(axes_.size());
     out.beams.resize(beams_.size());
     if (!evaluator_.valid() || values.size() != evaluator_.channels().size()) return;
@@ -629,7 +732,7 @@ void FixtureModel::resolve(const std::vector<ChannelValue>& values, FixtureState
     }
 
     // The fog or haze machine, wherever in the fixture its channel sits.
-    out.fog = 0.0;
+    double amount = -1.0, gate = 1.0;    // -1: no channel sets an amount, only switches
     for (size_t c = 0; c < values.size(); ++c) {
         if (channels_[static_cast<size_t>(evaluator_.channels()[c].channel)].is_virtual) continue;
         const ChannelValue& value = values[c];
@@ -637,8 +740,15 @@ void FixtureModel::resolve(const std::vector<ChannelValue>& values, FixtureState
         if (!info || info->kind != Kind::Fog) continue;
         const ChannelFunction& function = function_of(static_cast<int>(c), value);
         const double low = function.physical_from, high = function.physical_to;
-        out.fog = std::max(out.fog, high > low ? clamp01((value.physical - low) / (high - low)) : clamp01(value.physical));
+        const double share = high > low ? clamp01((value.physical - low) / (high - low)) : clamp01(value.physical);
+        if (info->on_off) {
+            gate *= clamp01(value.physical);
+        } else {
+            amount = std::max(amount, share);
+        }
     }
+    out.fog = (amount < 0.0 ? 1.0 : amount) * gate;
+    if (!has_fog_) out.fog = 0.0;
 
     for (size_t b = 0; b < beams_.size(); ++b) {
         const BeamBinding& binding = beams_[b];
@@ -790,17 +900,33 @@ void FixtureModel::resolve(const std::vector<ChannelValue>& values, FixtureState
                     beam.shaper_degrees = value.physical;
                     break;
                 case Kind::Dimmer:
-                    level *= fraction;
+                    level *= dimmer_curve(curve, fraction);
                     break;
-                case Kind::Shutter:
-                    level *= clamp01(value.physical);
+                case Kind::Shutter: {
+                    // Open is 1 and closed 0. Files do not all keep to that: Clay Paky's Sharpy has "Closed" at
+                    // 1 to 12 and "Open" as a set from 0 to 1 across four values. Where the set or the function is
+                    // called open or closed, that is what it is; otherwise its value, if it runs within 0 to 1.
+                    int said = value.channel_set >= 0 ? open_or_closed(function.channel_sets[static_cast<size_t>(value.channel_set)].name) : 0;
+                    if (said == 0) said = open_or_closed(function.name);
+                    if (said != 0) {
+                        level *= said > 0 ? 1.0 : 0.0;
+                    } else if (std::max(std::fabs(function.physical_from), std::fabs(function.physical_to)) <= 1.0) {
+                        level *= clamp01(value.physical);
+                    }
                     break;
+                }
                 case Kind::Strobe:
-                    beam.strobe_hz = std::max(value.physical, 0.0);
+                    // Hz. A file that leaves the range at 0 to 1 gives no real figure (the community RUSH PAR 2's
+                    // file): up to 20 flashes a second then, slow to fast, as most fixtures' strobes run; at 0 none,
+                    // as a separate strobe-effect channel at rest (GLP's X4 Bar) has it.
+                    beam.strobe_hz = std::max(high <= 1.0 ? (fraction > 0.0 ? 1.0 + 19.0 * fraction : 0.0) : value.physical, 0.0);
                     beam.strobe_shape = info->shape;
                     break;
                 case Kind::Zoom:
-                    if (value.physical > 0.0) {
+                    // Degrees, as GDTF has a zoom. A file whose zoom runs no further than 0 to 1 gives no angle
+                    // (the RUSH PAR 2 RGBW Zoom on GDTF Share, whose beam would otherwise be half a degree wide):
+                    // the beam keeps the angles the file gives it.
+                    if (value.physical > 0.0 && std::max(std::fabs(function.physical_from), std::fabs(function.physical_to)) > 1.0) {
                         const double ratio = binding.properties->beam_angle > 0.0
                                                  ? binding.properties->field_angle / binding.properties->beam_angle
                                                  : 1.0;
@@ -841,8 +967,19 @@ void FixtureModel::resolve(const std::vector<ChannelValue>& values, FixtureState
                     break;
                 case Kind::Wheel: {
                     if (!info->wheel || value.channel_set < 0) break;
-                    const int slot = function.channel_sets[static_cast<size_t>(value.channel_set)].wheel_slot_index;
+                    const ChannelSet& set = function.channel_sets[static_cast<size_t>(value.channel_set)];
+                    const int slot = set.wheel_slot_index;
                     if (slot < 1 || static_cast<size_t>(slot) > info->wheel->slots.size()) break;
+                    // A set that runs from a slot's middle toward its neighbour (one end at 0, the other
+                    // within half a slot, as Clay Paky's files have "White->White+Red") holds the wheel
+                    // that far round: between two colours, as a spinning wheel is drawn.
+                    const double from = set.physical_from.value_or(0.0), to = set.physical_to.value_or(0.0);
+                    const bool offset = (set.physical_from || set.physical_to) && (from == 0.0 || to == 0.0) && std::fabs(from) <= 0.5 && std::fabs(to) <= 0.5;
+                    if (offset && std::fabs(value.physical) > 1e-3) {
+                        beam.wheel = info->wheel;
+                        beam.wheel_degrees = (static_cast<double>(slot - 1) + value.physical) / static_cast<double>(info->wheel->slots.size()) * 360.0;
+                        break;
+                    }
                     const ColorRGB glass = to_linear_srgb(info->wheel->slots[static_cast<size_t>(slot - 1)].color);
                     filter.r *= clamp01(glass.r);
                     filter.g *= clamp01(glass.g);
@@ -850,10 +987,19 @@ void FixtureModel::resolve(const std::vector<ChannelValue>& values, FixtureState
                     break;
                 }
                 case Kind::Temperature: {
-                    // Only when the file gives kelvin; the tint is relative to the start of the range.
-                    if (value.physical < 1000.0 || function.physical_from < 1000.0) break;
-                    const ColorRGB now = color_temperature_rgb(value.physical);
-                    const ColorRGB start = color_temperature_rgb(function.physical_from);
+                    // In kelvin, the tint relative to the start of the range. A file that gives a CTO or CTB as an
+                    // amount from 0 to 1 instead (GLP's X4 Bar 20) is read as going from daylight to tungsten (CTO)
+                    // or the other way (CTB), 6500 K and 3200 K.
+                    double kelvin = value.physical, from = function.physical_from;
+                    if (std::max(std::fabs(function.physical_from), std::fabs(function.physical_to)) <= 1.0 && function.attribute != "CTC") {
+                        const double share = clamp01(value.physical);
+                        const bool warmer = function.attribute == "CTO";
+                        from = warmer ? 6500.0 : 3200.0;
+                        kelvin = warmer ? 6500.0 + (3200.0 - 6500.0) * share : 3200.0 + (6500.0 - 3200.0) * share;
+                    }
+                    if (kelvin < 1000.0 || from < 1000.0) break;
+                    const ColorRGB now = color_temperature_rgb(kelvin);
+                    const ColorRGB start = color_temperature_rgb(from);
                     ColorRGB tint{now.r / std::max(start.r, 1e-6), now.g / std::max(start.g, 1e-6), now.b / std::max(start.b, 1e-6)};
                     normalise(tint);
                     filter.r *= tint.r;
@@ -872,6 +1018,19 @@ void FixtureModel::resolve(const std::vector<ChannelValue>& values, FixtureState
             color = scale > 0.0 ? ColorRGB{mix.r / scale, mix.g / scale, mix.b / scale} : ColorRGB{0.0, 0.0, 0.0};
         } else if (has_rgb) {
             color = ColorRGB{rgb[0], rgb[1], rgb[2]};
+        }
+        // A filament's light is warm, and warmer the lower it burns. Light grows about as the voltage
+        // to the power 3.4 and colour temperature as its 0.42nd power, so a lamp burning at a fraction
+        // f of its light is at its rated temperature times f^(0.42/3.4): a 3200 K lamp at a fifth
+        // glows near 2600 K, at a twentieth near 2200 K. Only for lamps the file says are filaments,
+        // and not where emitters make the colour.
+        const LampType lamp = binding.properties->lamp_type;
+        if ((lamp == LampType::Tungsten || lamp == LampType::Halogen) && !has_additive && !has_rgb && level > 0.0) {
+            const double rated = binding.properties->color_temperature >= 1000.0 ? binding.properties->color_temperature : 3200.0;
+            const ColorRGB warm = color_temperature_rgb(std::max(rated * std::pow(clamp01(level), 0.42 / 3.4), 1200.0));
+            color.r *= warm.r;
+            color.g *= warm.g;
+            color.b *= warm.b;
         }
         color.r *= filter.r;
         color.g *= filter.g;

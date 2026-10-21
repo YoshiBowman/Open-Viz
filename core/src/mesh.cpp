@@ -853,6 +853,108 @@ MeshResult load_model_mesh(const Archive& gdtf, const Model& model) {
     return result;
 }
 
+namespace {
+
+// The indices of the points on the outline of `points` seen along one axis: a 2D rubber band
+// round them, taking coordinates `a` and `b` of each.
+std::vector<size_t> outline_of(const std::vector<std::array<double, 3>>& points, int a, int b) {
+    std::vector<size_t> order(points.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t i, size_t j) {
+        return points[i][static_cast<size_t>(a)] < points[j][static_cast<size_t>(a)] ||
+               (points[i][static_cast<size_t>(a)] == points[j][static_cast<size_t>(a)] && points[i][static_cast<size_t>(b)] < points[j][static_cast<size_t>(b)]);
+    });
+    auto turn = [&](size_t o, size_t p, size_t q) {
+        const auto& O = points[o];
+        const auto& P = points[p];
+        const auto& Q = points[q];
+        return (P[static_cast<size_t>(a)] - O[static_cast<size_t>(a)]) * (Q[static_cast<size_t>(b)] - O[static_cast<size_t>(b)]) -
+               (P[static_cast<size_t>(b)] - O[static_cast<size_t>(b)]) * (Q[static_cast<size_t>(a)] - O[static_cast<size_t>(a)]);
+    };
+    std::vector<size_t> hull;
+    for (int pass = 0; pass < 2; ++pass) {
+        const size_t start = hull.size();
+        for (size_t k = 0; k < order.size(); ++k) {
+            const size_t i = pass == 0 ? order[k] : order[order.size() - 1 - k];
+            while (hull.size() >= start + 2 && turn(hull[hull.size() - 2], hull.back(), i) <= 0.0) hull.pop_back();
+            hull.push_back(i);
+        }
+        hull.pop_back();
+    }
+    return hull;
+}
+
+}  // namespace
+
+std::vector<std::array<double, 3>> fixture_outline_points(const FixtureType& fixture, std::string_view root_geometry, const Archive* gdtf) {
+    Diagnostics unused;
+    const std::vector<GeometryInstance> tree = expand_geometry(fixture, root_geometry, unused);
+    std::vector<Matrix4> placed(tree.size());
+    std::vector<std::array<double, 3>> points;
+    std::map<std::string, std::vector<std::array<double, 3>>> shapes;    // each model's own points, once: a batten has one model for fifty cells
+    for (size_t index = 0; index < tree.size(); ++index) {
+        const GeometryInstance& instance = tree[index];
+        placed[index] = instance.parent >= 0 ? multiply(placed[static_cast<size_t>(instance.parent)], instance.local) : instance.local;
+        const Model* model = nullptr;
+        for (const Model& candidate : fixture.models) {
+            if (candidate.name == instance.geometry->model) model = &candidate;
+        }
+        if (!model) continue;
+        const bool turns = instance.geometry->type == GeometryType::Axis;
+        const std::string key = model->name + (turns ? "|centred" : "");
+        auto found = shapes.find(key);
+        if (found == shapes.end()) {
+            std::vector<std::array<double, 3>> own;
+            if (gdtf && !model->file.empty()) {
+                const MeshResult shape = load_model_mesh(*gdtf, *model);
+                if (shape.ok && shape.mesh.vertex_count() > 0) {
+                    std::vector<std::array<double, 3>> all(shape.mesh.vertex_count());
+                    for (size_t v = 0; v < all.size(); ++v) {
+                        for (size_t k = 0; k < 3; ++k) all[v][k] = static_cast<double>(shape.mesh.positions[v * 3 + k]);
+                    }
+                    // Only what can be on an outline: the points on the shape's own three outlines.
+                    std::vector<bool> kept(all.size(), false);
+                    for (const auto& view : {std::array<int, 2>{0, 1}, std::array<int, 2>{0, 2}, std::array<int, 2>{1, 2}}) {
+                        for (size_t i : outline_of(all, view[0], view[1])) kept[i] = true;
+                    }
+                    for (size_t v = 0; v < all.size(); ++v) {
+                        if (kept[v]) own.push_back(all[v]);
+                    }
+                }
+            }
+            if (own.empty() && model->length > 0.0 && model->width > 0.0 && model->height > 0.0) {
+                const bool centred = turns || model->primitive_type == "Cube" || model->primitive_type == "Cylinder" || model->primitive_type == "Sphere";
+                for (int corner = 0; corner < 8; ++corner) {
+                    own.push_back({corner & 1 ? model->length / 2.0 : -model->length / 2.0, corner & 2 ? model->width / 2.0 : -model->width / 2.0,
+                                   corner & 4 ? (centred ? model->height / 2.0 : 0.0) : (centred ? -model->height / 2.0 : -model->height)});
+                }
+            }
+            found = shapes.emplace(key, std::move(own)).first;
+        }
+        const Matrix4& at = placed[index];
+        for (const auto& local : found->second) {
+            std::array<double, 3> point{};
+            bool finite = true;
+            for (size_t axis = 0; axis < 3; ++axis) {
+                point[axis] = at.m[axis][0] * local[0] + at.m[axis][1] * local[1] + at.m[axis][2] * local[2] + at.m[axis][3];
+                finite = finite && std::isfinite(point[axis]);
+            }
+            if (finite) points.push_back(point);
+        }
+    }
+    if (points.size() < 3) return points;
+    // The whole fixture's outlines, from its parts' points.
+    std::vector<bool> kept(points.size(), false);
+    for (const auto& view : {std::array<int, 2>{0, 1}, std::array<int, 2>{0, 2}, std::array<int, 2>{1, 2}}) {
+        for (size_t i : outline_of(points, view[0], view[1])) kept[i] = true;
+    }
+    std::vector<std::array<double, 3>> out;
+    for (size_t i = 0; i < points.size(); ++i) {
+        if (kept[i]) out.push_back(points[i]);
+    }
+    return out;
+}
+
 Bounds fixture_bounds(const FixtureType& fixture, std::string_view root_geometry, const Archive* gdtf) {
     Bounds bounds;
     Diagnostics unused;
