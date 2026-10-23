@@ -15,7 +15,7 @@ The same folder runs on a Mac and on Windows: the visualizer is built on the com
 Download the installer for your computer from the newest release on [Releases](https://github.com/YoshiBowman/Open-Viz/releases). Openviz also needs Unreal Engine 5.8, installed from the [Epic Games Launcher](https://store.epicgames.com/download) with your Epic account.
 
 - **Windows: `Openviz-<version>-Windows.exe`.** Run it. Windows may say it protected your PC from an unrecognised app: More info, Run anyway. Choose the folder (`C:\Openviz`), Install, and leave "Set Openviz up now" ticked: a window checks for Python, Visual Studio and Unreal Engine (and offers to install the first two and the Epic Games Launcher), builds Openviz and puts it in the Start menu. "Set up Openviz" in the Start menu does that again, for example once Unreal is installed. Openviz is removed in Settings, Apps, Installed apps; your shows are kept unless you say otherwise.
-- **Mac: `Openviz-<version>-Mac.dmg`.** Open it and drag Openviz to Applications, then open Openviz. The first time, macOS may say it cannot check the app: System Settings, Privacy & Security, Open Anyway. Openviz needs Xcode (step 1 below), as Unreal does. It keeps its shows and its own files in `~/Openviz`; a newer Openviz from a newer .dmg updates them and keeps your shows.
+- **Mac: `Openviz-<version>-Mac.dmg`.** Open it and drag Openviz to Applications, then open Openviz. If Apple's Command Line Tools are not on the Mac yet, Openviz offers to install them (Apple's own installer) and goes on by itself once they are in. Then **System, Setup** in Openviz lists everything else the visualizer needs, in order (Xcode, Xcode set up, its Metal toolchain, Unreal Engine 5.8, the visualizer's build), installs or opens each with one button, and ticks each off once it is there. Openviz keeps its shows and its own files in `~/Openviz`. A signed release installs newer releases by itself (System, Updates); one that is not signed makes macOS ask the first time: System Settings, Privacy & Security, Open Anyway.
 
 The first time a show is watched, Openviz builds the visualizer: ten minutes to half an hour.
 
@@ -37,11 +37,7 @@ sudo xcodebuild -runFirstLaunch
 xcodebuild -downloadComponent MetalToolchain
 ```
 
-2. Install [Homebrew](https://brew.sh), then Git LFS and CMake:
-
-```bash
-brew install git-lfs cmake
-```
+2. Install [Git LFS](https://git-lfs.com) (for example with [Homebrew](https://brew.sh): `brew install git-lfs`), then:
 
 ```bash
 git lfs install
@@ -55,7 +51,7 @@ git clone https://github.com/YoshiBowman/Open-Viz.git ~/Openviz
 ```
 
 ```bash
-cd ~/Openviz && cmake -S core -B core/build && cmake --build core/build -j
+python3 ~/Openviz/launcher/core_build.py
 ```
 
 ```bash

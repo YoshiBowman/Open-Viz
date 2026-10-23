@@ -24,6 +24,10 @@ namespace
 	constexpr int32 kShadePlaces = 19;
 	constexpr int32 kShadePerFrame = 6;
 
+	// The cone a frost filter at full scatters light into, in degrees: GDTF gives frost only as an
+	// amount, and this is about what a heavy frost does to a beam fixture.
+	constexpr double kFrostDegrees = 20.0;
+
 	const FVector2D* ShadePlaces()
 	{
 		static FVector2D Places[kShadePlaces];
@@ -1535,8 +1539,13 @@ bool ALvFixtureActor::BuildGateLook(int32 Index, float DeltaSeconds, double Fiel
 		}
 	}
 
-	// Frost spreads the beam as well as softening it.
-	const double Widen = FMath::RoundToDouble((1.0 + 0.6 * Beam.frost) * 64.0) / 64.0;
+	// Frost spreads the beam as well as softening it. A frost filter scatters what passes it into a cone
+	// of its own, which adds to the beam's angle as two blurs add (in quadrature): a narrow beam becomes
+	// a soft wash of about that cone, a wide one changes little. The gate's pictures, iris and blades
+	// are spread with it (the materials divide by the widening), and the light is spread as thinly.
+	const double TanOwn = FMath::Tan(FMath::DegreesToRadians(FieldAngle * 0.5));
+	const double TanFrost = FMath::Tan(FMath::DegreesToRadians(kFrostDegrees * 0.5 * Beam.frost));
+	const double Widen = FMath::RoundToDouble(FMath::Sqrt(TanOwn * TanOwn + TanFrost * TanFrost) / TanOwn * 64.0) / 64.0;
 	double Spread = Widen;
 	int32 Facets = 0;
 	if (Prism && Second)

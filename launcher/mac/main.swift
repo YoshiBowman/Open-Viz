@@ -94,16 +94,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         return target.path
     }
 
-    private func startServer() {
-        // Openviz runs on the Python that comes with Xcode's tools, which Unreal Engine needs too.
-        let tools = Process()
-        tools.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
-        tools.arguments = ["-p"]
-        tools.standardOutput = FileHandle.nullDevice
-        tools.standardError = FileHandle.nullDevice
-        if (try? tools.run()) == nil || { tools.waitUntilExit(); return tools.terminationStatus != 0 }() {
-            return fail("Openviz needs Xcode, as Unreal Engine does on a Mac. Install Xcode from the App Store or developer.apple.com, open it once, then open Openviz again.")
+    // MARK: Apple's developer tools
+
+    // Whether a program ran and ended well.
+    private func succeeds(_ path: String, _ arguments: [String]) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return false }
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+
+    // Openviz runs on the Python that Apple's developer tools bring (the Command Line Tools, or
+    // Xcode, which the visualizer needs later). Everything after them is on Openviz's own Setup
+    // page; without them that page cannot be shown, so this one step is asked for here.
+    private func developerToolsReady() -> Bool {
+        succeeds("/usr/bin/xcode-select", ["-p"]) && succeeds("/usr/bin/python3", ["-c", "pass"])
+    }
+
+    private var waitingForTools: Timer?
+
+    private func askForDeveloperTools() {
+        let alert = NSAlert()
+        alert.messageText = "Openviz needs Apple's Command Line Tools"
+        alert.informativeText = "They bring the Python that Openviz runs on and the compiler it builds with: a download from Apple that takes a few minutes. Apple's installer asks before anything is downloaded.\n\nXcode and Unreal Engine, which the visualizer needs, come after: Openviz's Setup page takes you through them."
+        alert.addButton(withTitle: "Install")
+        alert.addButton(withTitle: "Quit")
+        guard alert.runModal() == .alertFirstButtonReturn else { return NSApp.terminate(nil) }
+        _ = succeeds("/usr/bin/xcode-select", ["--install"])
+        showMessage("Installing Apple's Command Line Tools",
+                    "Follow Apple's installer. Openviz goes on by itself once they are installed; this window can stay open.")
+        waitingForTools = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] timer in
+            guard let self = self, self.developerToolsReady() else { return }
+            timer.invalidate()
+            self.waitingForTools = nil
+            self.startServer()
         }
+    }
+
+    // A few words in the window, in the page's own colours, while there is no page yet.
+    private func showMessage(_ title: String, _ text: String) {
+        let escape = { (s: String) in s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;") }
+        web.loadHTMLString("""
+            <html><body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0c0d10;color:#e8eaee;font:15px -apple-system,sans-serif">
+            <div style="max-width:520px;text-align:center;line-height:1.5"><div style="font-size:20px;font-weight:600;margin-bottom:10px">\(escape(title))</div>
+            <div style="color:#a3a9b5">\(escape(text))</div></div></body></html>
+            """, baseURL: nil)
+    }
+
+    private func startServer() {
+        guard developerToolsReady() else { return askForDeveloperTools() }
         guard let repo = projectFolder() else { return }
         let script = repo + "/launcher/launcher.py"
         let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("Logs")
@@ -120,6 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             + (given["OPENVIZ_LAUNCHER_ARGS"] ?? "").split(separator: " ").map(String.init)
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+        environment["OPENVIZ_APP"] = Bundle.main.bundlePath    // the app an update replaces (launcher/updater.py)
         process.environment = environment
         let pipe = Pipe()
         process.standardOutput = pipe

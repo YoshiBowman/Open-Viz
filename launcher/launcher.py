@@ -59,6 +59,9 @@ import mvr_xchange  # noqa: E402
 import osc  # noqa: E402
 import psn  # noqa: E402
 import ndi_find  # noqa: E402
+import core_build  # noqa: E402
+import setup_check  # noqa: E402
+import updater  # noqa: E402
 import package  # noqa: E402
 import oslayer  # noqa: E402
 import paperwork  # noqa: E402
@@ -123,6 +126,7 @@ DEFAULTS = {
     "psn": False,                  # hear PosiStageNet: set pieces follow the trackers they are given
     "psn_group": "236.10.10.10",   # the multicast group it comes to; empty: sent to this computer's own address
     "psn_port": 56565,
+    "update_check": True,          # look on GitHub for a newer Openviz when the System page or the window opens
 }
 
 # What to tell someone who drops a file this cannot read. The applications' own formats are
@@ -337,6 +341,15 @@ class Launcher:
         self.code_files = [os.path.abspath(__file__), RELAY, gdtf_share.__file__, paperwork.__file__, paperwork.pdf.__file__, ndi_find.__file__, oslayer.__file__, mvr_xchange.__file__, mvr_xchange.mdns.__file__]
         self._code_stamp = self._code_changed_at()    # to notice being out of date: see state()
         self._run = None             # the Unreal process started last, and what it was started on
+        self._setup_system = setup_check.System()    # what the setup list asks the computer; the tests give a stand-in
+        self._setup_jobs = {}        # a step of the setup list whose action is running -> its process or thread
+        self._setup_cache = None     # (when, the list as last looked at)
+        self._core_error = ""        # why the core's last build here failed
+        # Updates (updater.py): the app an update replaces and its process, as Openviz.app says when it starts this.
+        self.app_path = os.environ.get("OPENVIZ_APP", "")
+        self.app_pid = 0
+        self._fetch_releases = lambda: updater.fetch_json(updater.RELEASES)    # the tests give a stand-in
+        self._update = {"checked": 0.0, "offer": None, "state": "idle", "message": ""}
 
     # ------------------------------------------------------------------------------- settings
 
@@ -367,7 +380,7 @@ class Launcher:
         for key, value in changes.items():
             if key not in DEFAULTS:
                 raise Problem(f"There is no setting named {key}.")
-            if key in ("megalights", "shadows", "beam_shadows", "adapt_beams", "rig_haze", "idle_look", "invert_y", "motion_blur", "surface_colour"):
+            if key in ("megalights", "shadows", "beam_shadows", "adapt_beams", "rig_haze", "idle_look", "invert_y", "motion_blur", "surface_colour", "update_check"):
                 if not isinstance(value, bool):
                     raise Problem(f"{key} must be on or off.")
             elif key == "protocol":
@@ -502,10 +515,14 @@ class Launcher:
         except OSError:
             return 0.0
 
+    @staticmethod
+    def _visualizer_built():
+        return os.path.isdir(PLUGIN_BINARIES) and any("LvShow" in name for _, _, names in os.walk(PLUGIN_BINARIES) for name in names)
+
     def state(self):
         settings = self.settings()
         engine_found = os.path.exists(editor_binary(settings["engine"]))
-        built = os.path.isdir(PLUGIN_BINARIES) and any("LvShow" in name for _, _, names in os.walk(PLUGIN_BINARIES) for name in names)
+        built = self._visualizer_built()
         return {
             "settings": settings,
             "addresses": local_addresses(),
@@ -514,6 +531,7 @@ class Launcher:
             "project_stale": self.visualizer_stale() if built else [False, ""],
             "build": self.build_state(),
             "core_built": os.path.exists(self.inspector),
+            "setup": {key: value for key, value in self.setup_state().items() if key != "items"},
             "build_command": oslayer.build_command(settings["engine"], self.project),
             "share": self.share_state(),
             "run": self.run_state(),
@@ -3186,6 +3204,145 @@ class Launcher:
             except Problem as problem:
                 build["error"] = f"Built, but it could not be started: {problem}"
 
+    # ---------------------------------------------------------------------------------- setup
+
+    def setup_state(self, fresh=False):
+        """The System page's setup list (setup_check.py): what this computer has of what Openviz
+        needs, in the order it is to be done, each with what can be done about it from here, and
+        which of those are under way. Looked at again at most every few seconds."""
+        self._setup_finished()
+        with self._lock:
+            cached = self._setup_cache
+        if fresh or not cached or time.time() - cached[0] > 4.0:
+            kind = setup_check.kind_of()
+            listed = setup_check.items(self._setup_system, kind, REPO, self.settings()["engine"], self._setup_facts(kind))
+            with self._lock:
+                self._setup_cache = cached = (time.time(), listed)
+        working = set(self._setup_jobs)
+        if self._build and self._build.get("running"):
+            working.add("visualizer")
+        items = [dict(item, working=item["key"] in working) for item in cached[1]]
+        return {"kind": setup_check.kind_of(), "items": items, **setup_check.summary(items)}
+
+    def _setup_facts(self, kind):
+        built = self._visualizer_built()
+        core = self.inspector if os.path.exists(self.inspector) else ""
+        return {"core": core, "core_error": "" if core else self._core_error, "built": built,
+                "stale": list(self.visualizer_stale()) if built else [False, ""],
+                "git": os.path.isdir(os.path.join(REPO, ".git")), "epic_launcher": setup_check.epic_launcher(kind, self._setup_system),
+                "visual_studio": oslayer.visual_studio() if kind == "windows" else ""}
+
+    def _setup_finished(self):
+        """Lets go of steps whose installers, downloads or builds have ended, so that they are looked at again."""
+        with self._lock:
+            for key, job in list(self._setup_jobs.items()):
+                alive = job.is_alive() if isinstance(job, threading.Thread) else job.poll() is None
+                if not alive:
+                    del self._setup_jobs[key]
+                    self._setup_cache = None
+
+    def setup_act(self, key):
+        """Does what a step of the setup list offers: starts an installer, opens a page or an app,
+        asks for an administrator's password in the system's own window, or builds."""
+        state = self.setup_state(fresh=True)
+        item = next((entry for entry in state["items"] if entry["key"] == key), None)
+        if item is None:
+            raise Problem("There is no such step in the setup.")
+        if item["ok"] or item["working"] or not item["action"]:
+            return state
+        kind = state["kind"]
+        if key == "core":
+            job = threading.Thread(target=self._build_core, daemon=True)
+            job.start()
+        elif key == "visualizer":
+            self.build_visualizer(reason="asked for under System, Setup")
+            job = None
+        else:
+            command = setup_check.command_for(kind, key, self.settings()["engine"], self._setup_facts(kind), self._setup_system)
+            if not command:
+                raise Problem("This step cannot be started from Openviz.")
+            try:
+                job = self._setup_system.start(command)
+            except OSError as error:
+                raise Problem(f"It could not be started: {error}") from None
+        with self._lock:
+            if job is not None:
+                self._setup_jobs[key] = job
+            self._setup_cache = None
+        return self.setup_state()
+
+    def _build_core(self):
+        """Builds the core's inspector (core_build.py: CMake, or on a Mac without it Apple's compiler), into library/logs/core-build.log."""
+        try:
+            with open(os.path.join(self.logs_dir, "core-build.log"), "wb") as log:
+                core_build.build(REPO, log=log)
+            self._core_error = ""
+        except (core_build.BuildFailed, OSError) as error:
+            self._core_error = f"The core did not build: {error} The whole of it is in library/logs/core-build.log."
+
+    # -------------------------------------------------------------------------------- updates
+
+    def update_state(self, fresh=False):
+        """Whether GitHub has a newer Openviz (updater.py), looked at no more than every half hour
+        unless asked, and never unless "Check for updates" is on or the page asks; and how far an
+        update being installed has come."""
+        current = openviz_version().replace(" ", "-")
+        with self._lock:
+            update = self._update
+            due = fresh or (self.settings()["update_check"] and time.time() - update["checked"] > 1800)
+        if due and update["state"] != "installing":
+            try:
+                found = updater.offer(current, self._fetch_releases())
+                message = update["message"] if update["state"] in ("installed", "failed") else ""
+            except (OSError, ValueError) as error:
+                found, message = update["offer"], f"GitHub could not be reached ({error})."
+            with self._lock:
+                update.update(checked=time.time(), offer=found, message=message)
+        offer = update["offer"] or {"current": current, "latest": "", "available": False, "page": "", "notes": ""}
+        why_not = updater.why_not_here(self.app_path, REPO) if oslayer.MAC else "On Windows an update is installed with the release's own installer for now."
+        return {"current": current, "latest": offer["latest"], "available": offer["available"], "page": offer["page"], "notes": offer["notes"][:4000],
+                "can_install": offer["available"] and not why_not, "why_not": why_not, "state": update["state"], "message": update["message"],
+                "checked": int(update["checked"]), "check": self.settings()["update_check"]}
+
+    def update_install(self):
+        """Downloads, checks and installs the newer release in the background (updater.install_mac)."""
+        state = self.update_state()
+        if not state["available"]:
+            raise Problem("There is no newer Openviz to install.")
+        if state["why_not"]:
+            raise Problem(state["why_not"])
+        with self._lock:
+            if self._update["state"] == "installing":
+                return self.update_state()
+            if self._run and self._run["process"].poll() is None or oslayer.project_open(self.project):
+                raise Problem("Close the visualizer first: an update replaces what it runs from.", code="running")
+            self._update.update(state="installing", message="Downloading and checking the update…")
+            release = self._update["offer"]["release"]
+        threading.Thread(target=self._install_update, args=(release,), daemon=True).start()
+        return self.update_state()
+
+    def _install_update(self, release):
+        work = updater.work_folder()
+        try:
+            updater.install_mac(release, self.app_path, work, updater.run_program, updater.download_file)
+            state, message = "installed", f"Openviz {release['version'].replace('-', ' ')} is installed. Restart Openviz to finish."
+        except updater.UpdateRefused as refused:
+            state, message = "failed", str(refused)
+        except OSError as error:
+            state, message = "failed", f"The update could not be installed: {error}"
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        with self._lock:
+            self._update.update(state=state, message=message)
+
+    def update_restart(self):
+        """Opens the updated app once this one has quit, and quits it."""
+        if self._update["state"] != "installed" or not self.app_path or not self.app_pid:
+            raise Problem("There is no installed update waiting for a restart.")
+        updater.reopen_after(self.app_pid, self.app_path)
+        threading.Timer(0.3, lambda: os.kill(self.app_pid, signal.SIGTERM)).start()
+        return {"restarting": True}
+
     def build_state(self):
         """The build in progress or last made: whether it runs, how it ended, and its last step."""
         build = self._build
@@ -4258,6 +4415,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return launcher.state()
             if path == "/api/here":    # the page saying it is still open (see _exit_with_window)
                 return {"here": True}
+            if path == "/api/setup":
+                return launcher.setup_state(fresh=query.get("fresh", [""])[0] == "1")
+            if path == "/api/update":
+                return launcher.update_state(fresh=query.get("fresh", [""])[0] == "1")
             if path == "/api/shows":
                 return {"shows": launcher.shows(), "found": launcher.found_exports()}
             if path == "/api/fixtures":
@@ -4354,6 +4515,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return launcher.crash_report()
         if path == "/api/build":
             return launcher.build_visualizer(reason="asked for")
+        if path == "/api/setup/act":
+            return launcher.setup_act(body.get("key"))
+        if path == "/api/update/install":
+            return launcher.update_install()
+        if path == "/api/update/restart":
+            return launcher.update_restart()
         if path == "/api/export/patch":
             return launcher.export_patch(body.get("name"))
         if path == "/api/export/paper":
@@ -4627,6 +4794,7 @@ def main(argv=None):
     print(f"URL {server.url}", flush=True)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
     if args.parent:
+        launcher.app_pid = args.parent    # the app, which an update is opened in place of
         threading.Thread(target=_exit_with_parent, args=(args.parent, server), daemon=True).start()
     running = _running_file(args.library)
     if args.window:

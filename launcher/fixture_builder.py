@@ -111,6 +111,17 @@ GOBO_PATTERNS = ["Dot", "Ring", "Three Dots", "Bars", "Star", "Cross", "Breakup"
                  "Tunnel", "Flower"]
 
 
+# How far off the beam's axis a prism's copies go at least, in degrees: a narrow beam's copies at the
+# usual 1.25 beam radii would overlap into one blob, which looks the same however the prism turns.
+PRISM_DEGREES = 5.0
+
+
+def prism_reach(field_angle):
+    """Where a prism's copies sit, in beam radii (as GDTF files give a facet's offset): 1.25, as spots'
+    files have them, or further out for a beam so narrow that they would overlap, PRISM_DEGREES off its axis."""
+    return max(1.25, math.tan(math.radians(PRISM_DEGREES)) / math.tan(math.radians(field_angle / 2)))
+
+
 class BuildError(ValueError):
     """What is wrong with a description, said so that the page can show it."""
 
@@ -603,9 +614,9 @@ def build_description(spec):
         ET.SubElement(wheel, "Slot", {"Name": "Open", "Color": WHITE})
         slot = ET.SubElement(wheel, "Slot", {"Name": f"{spec['prism_facets']}-Facet Prism", "Color": WHITE})
         # Each facet's matrix carries its image's offset in its third row, in beam radii, as manufacturers' files do.
+        reach = prism_reach(spec["field_angle"])
         for k in range(spec["prism_facets"]):
             angle = math.pi / 2 + 2 * math.pi * k / spec["prism_facets"]
-            reach = 1.25
             ET.SubElement(slot, "Facet", {"Color": WHITE, "Rotation": "{1.000000,0.000000,0.000000}{0.000000,1.000000,0.000000}{%.6f,%.6f,1.000000}"
                                           % (reach * math.cos(angle), reach * math.sin(angle))})
     physical = ET.SubElement(fixture, "PhysicalDescriptions")

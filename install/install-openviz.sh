@@ -4,11 +4,13 @@
 # Double-click "Install Openviz.command", or in Terminal:
 #   curl -fsSL https://raw.githubusercontent.com/YoshiBowman/Open-Viz/main/install/install-openviz.sh | sh
 #
-# It asks where Openviz is to go (~/Openviz unless told otherwise), checks what Openviz needs,
-# downloads the release and checks it against the checksum GitHub gives, unpacks it, builds the
-# core and the Openviz app, and opens it. Run it again to update: the shows, fixtures and settings
-# in the folder's library/ are kept. It never asks for your password; what needs one (Xcode's
-# licence, Homebrew) it tells you to do yourself.
+# It asks where Openviz is to go (~/Openviz unless told otherwise), has Apple's own installer put
+# in the Command Line Tools if they are missing (all Openviz needs to start), downloads the release
+# and checks it against the checksum GitHub gives, unpacks it, builds the core (with CMake if there
+# is one, else with Apple's compiler) and the Openviz app, and opens it. Run it again to update: the
+# shows, fixtures and settings in the folder's library/ are kept. It never asks for your password.
+# Xcode, its Metal toolchain and Unreal Engine, which the visualizer needs, are listed under
+# System, Setup in Openviz, which installs or opens each of them in turn.
 #
 # Settings for those who want them: OPENVIZ_DIR (where Openviz goes), OPENVIZ_APPS (where the app
 # goes, /Applications), OPENVIZ_NO_OPEN=1 (do not open it at the end), UE_ROOT (Unreal's folder).
@@ -24,50 +26,31 @@ main() {
     say "This puts Openviz, a show-lighting visualizer, on this Mac, from github.com/$REPOSITORY."
 
     step "1. What Openviz needs"
-    missing=""
-    if ! xcode-select -p >/dev/null 2>&1; then
-        missing="yes"
-        say "NOT FOUND  Xcode. Install it from https://developer.apple.com/download/all (or the App Store) and open it once."
-    elif ! xcrun clang --version >/dev/null 2>&1; then
-        missing="yes"
-        say "NOT READY  Xcode's licence is not accepted yet. In Terminal: sudo xcodebuild -license   (it asks for your password)"
-    else
-        say "ok         Xcode's tools ($(xcode-select -p))"
-    fi
-    if ! /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
-        missing="yes"
-        say "NOT FOUND  Python 3.9 or newer (it comes with Xcode's tools)"
-    else
-        say "ok         Python $(/usr/bin/python3 -c 'import platform; print(platform.python_version())')"
-    fi
-    cmake="$(command -v cmake || true)"
-    for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake /Applications/CMake.app/Contents/bin/cmake; do
-        [ -z "$cmake" ] && [ -x "$candidate" ] && cmake="$candidate"
-    done
-    brew="$(command -v brew || true)"
-    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
-        [ -z "$brew" ] && [ -x "$candidate" ] && brew="$candidate"
-    done
-    if [ -z "$cmake" ] && [ -n "$brew" ] && yes_no "CMake is needed to build Openviz's core. Install it with Homebrew now?" y; then
-        "$brew" install cmake && cmake="$(dirname "$brew")/cmake"
-    fi
-    if [ -n "$cmake" ] && [ -x "$cmake" ]; then
-        say "ok         CMake ($cmake)"
-    else
-        missing="yes"
-        if [ -n "$brew" ]; then
-            say "NOT FOUND  CMake. In Terminal: brew install cmake"
+    if ! xcode-select -p >/dev/null 2>&1 || ! /usr/bin/python3 -c 'pass' >/dev/null 2>&1; then
+        say "missing    Apple's Command Line Tools: the Python Openviz runs on and the compiler it builds with."
+        if yes_no "Install them now? Apple's installer asks before it downloads anything." y; then
+            xcode-select --install >/dev/null 2>&1 || true
+            say "           Follow Apple's installer; this goes on by itself once they are installed."
+            waited=0
+            until xcode-select -p >/dev/null 2>&1 && /usr/bin/python3 -c 'pass' >/dev/null 2>&1; do
+                sleep 5
+                waited=$((waited + 5))
+                [ "$waited" -ge 3600 ] && fail "the Command Line Tools did not arrive within an hour. Run this installer again once they are in."
+            done
         else
-            say "NOT FOUND  CMake. Install Homebrew (https://brew.sh, it asks for your password), then in Terminal: brew install cmake"
+            fail "Openviz cannot start without them. Run this installer again when you want them."
         fi
     fi
+    if ! /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
+        fail "Python 3.9 or newer is needed, and Apple's tools bring an older one. Update the Command Line Tools in System Settings, Software Update."
+    fi
+    say "ok         Apple's developer tools ($(xcode-select -p)), Python $(/usr/bin/python3 -c 'import platform; print(platform.python_version())')"
     if [ -x "$engine/Engine/Binaries/Mac/UnrealEditor.app/Contents/MacOS/UnrealEditor" ]; then
         say "ok         Unreal Engine 5.8 ($engine)"
     else
-        say "later      Unreal Engine 5.8 is not installed. Openviz installs without it, but needs it to show a rig:"
-        say "           install the Epic Games Launcher (https://store.epicgames.com/download) and, in it, Unreal Engine 5.8."
+        say "later      Unreal Engine 5.8, Xcode and its Metal toolchain, for the visualizer: Openviz lists them under"
+        say "           System, Setup, and installs or opens each in turn."
     fi
-    [ -n "$missing" ] && fail "put right what is NOT FOUND or NOT READY above, then run this installer again."
 
     step "2. Where Openviz goes"
     dest="${OPENVIZ_DIR:-}"
@@ -130,8 +113,8 @@ PYTHON
     say "ok         $dest"
 
     step "5. Building Openviz's core"
-    "$cmake" -S "$dest/core" -B "$dest/core/build" >/dev/null && "$cmake" --build "$dest/core/build" -j >/dev/null \
-        || fail "the core did not build. In Terminal: \"$cmake\" --build \"$dest/core/build\"  shows why."
+    /usr/bin/python3 "$dest/launcher/core_build.py" >/dev/null \
+        || fail "the core did not build. In Terminal: python3 \"$dest/launcher/core_build.py\" --verbose  shows why."
     say "ok         $dest/core/build/vizcore_inspect"
 
     step "6. The Openviz app"

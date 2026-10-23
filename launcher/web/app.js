@@ -211,9 +211,19 @@ function pageHead(title, subtitle, ...actions) {
 }
 
 function ready() {
-  if (!state.engine_found) return "Unreal Engine was not found. Set its folder under System.";
-  if (!state.project_built) return "The visualizer has not been built yet. See System.";
+  if (!state.engine_found) return "Unreal Engine was not found: Setup, under System, takes you through what is needed.";
+  if (!state.project_built) return "The visualizer has not been built yet: see Setup, under System.";
   return "";
+}
+
+// On the Shows page while this computer still lacks something a rig needs (the visualizer builds by itself when a show is watched).
+function setupNotice() {
+  const left = ((state.setup || {}).left || []).filter((name) => name !== "Visualizer");
+  if (!left.length) return null;
+  return el("div", { class: "notice" }, icon("alert"), el("div", { class: "text" },
+    el("b", {}, "Openviz needs a few more things on this computer"),
+    el("div", {}, `Still to do: ${left.join(", ")}. Setup takes you through them, one step at a time.`)),
+    el("button", { class: "small", onclick: () => go("system") }, "Open Setup"));
 }
 
 // A menu of actions under a button; it closes on a choice, a click elsewhere or Escape.
@@ -381,7 +391,7 @@ async function drawShowsPage() {
     pageHead("Shows", "Your rigs, imported as MVR. Open a show to work on its patch, fixture types, set and paperwork.",
       el("button", { onclick: () => $("file").click() }, icon("upload"), "Import…")),
     kept || el("div", { class: "page-notice" }),
-    drop, how, found, offered,
+    setupNotice(), drop, how, found, offered,
     el("h2", {}, answer.shows.length ? `${plural(answer.shows.length, "Show")}` : "Shows"),
     answer.shows.length ? el("div", { class: "shows" }, answer.shows.map(showCard))
       : el("div", { class: "empty" }, el("b", {}, "No shows yet"), "Drop an MVR file above, or import one from your console's export folder."));
@@ -2158,7 +2168,7 @@ async function save(changes, redraw) {
     return;
   }
   redraw();
-  $("engine-dot").classList.toggle("off", !!ready());
+  markSetup();
 }
 
 function setting(title, help, control) {
@@ -2722,31 +2732,125 @@ function renderVisualizer() {
 
 // ------------------------------------------------------------------------------------- system
 
+let setupTimer = 0;
+
 function renderSystem() {
   const s = state.settings;
-  const build = el("button", { onclick: async (event) => {
-    const button = event.currentTarget;    // gone from the event once it has been awaited
-    button.disabled = true;
-    try { renderRun({ running: false, building: await api("/api/build", { json: {} }) }); pollRun(); }
-    catch (error) { pageNotice().replaceChildren(notice(error.message, "error")); button.disabled = false; }
-  } }, "Build Now");
-  const stale = state.project_built && state.project_stale && state.project_stale[0];
   put($("system"),
-    pageHead("System", "Unreal Engine, the visualizer build and where Openviz keeps its files."),
+    pageHead("System", "What Openviz needs on this computer, the engine it uses and where it keeps its files."),
     el("div", { class: "page-notice" }),
+    el("h2", { id: "setup-head" }, "Setup"),
+    el("div", { id: "setup" }, el("div", { class: "group" }, el("div", { class: "setting" }, el("div", { class: "what" }, el("span", {}, "Looking at this computer…"))))),
+    el("h2", {}, "Updates"),
+    el("div", { id: "updates" }),
+    el("h2", {}, "Engine and Files"),
     el("div", { class: "group" },
-      setting("Unreal Engine", state.engine_found ? el("span", { class: "good" }, "Unreal Engine 5.8 found.") : el("span", { class: "bad" }, "No Unreal Engine in this folder."),
+      setting("Unreal Engine Folder", "Where Unreal Engine 5.8 is installed. Found by itself in the usual places.",
         el("input", { type: "text", value: s.engine, spellcheck: "false", "aria-label": "Unreal Engine folder",
                       onchange: (event) => save({ engine: event.target.value }, renderSystem) })),
-      setting("Visualizer", stale ? `Its code has changed since it was built (${state.project_stale[1]}). It is rebuilt before it next opens, or now.`
-        : state.project_built ? el("span", { class: "good" }, "Built and up to date.")
-        : el("span", {}, el("span", { class: "bad" }, "Not built yet. "), "It is built before it first opens, or now."),
-        stale || !state.project_built ? build : el("span", { class: "badge good" }, "Ready")),
-      setting("Core Library", state.core_built ? "Built: files are checked as they are added, and patches can be listed."
-        : el("span", { class: "bad" }, "Not built: files are not checked and patches cannot be listed."), el("span", { class: `badge ${state.core_built ? "good" : "bad"}` }, state.core_built ? "Ready" : "Missing")),
       setting("Files", el("span", {}, "Shows, fixtures and settings are kept in ", el("code", {}, state.library), "."),
         [el("button", { onclick: () => reveal("shows") }, icon("folder"), "Shows"), el("button", { onclick: () => reveal("logs") }, "Logs")])),
-    !state.project_built ? el("p", { class: "help" }, "To build from a terminal instead: ", el("code", {}, state.build_command)) : null);
+    el("p", { class: "help" }, "To build the visualizer from a terminal instead: ", el("code", {}, state.build_command)));
+  loadSetup();
+  loadUpdates();
+}
+
+// Updates (launcher/updater.py): a newer release on GitHub, installed only when it is signed by the
+// same developer team as this app and Apple has notarized it.
+async function loadUpdates(fresh) {
+  let answer;
+  try { answer = await api(`/api/update${fresh ? "?fresh=1" : ""}`); } catch (error) { return; }
+  markUpdate(answer);
+  renderUpdates(answer);
+  if (answer.state === "installing") setTimeout(loadUpdates, 2000);
+}
+
+function renderUpdates(u) {
+  const holder = $("updates");
+  if (!holder) return;
+  const named = (version) => version.replace(/-/g, " ");
+  const act = (path, label) => el("button", { class: "primary", onclick: async (event) => {
+    event.currentTarget.disabled = true;
+    try { const answer = await api(path, { json: {} }); if (answer.restarting) return; renderUpdates(answer); setTimeout(loadUpdates, 2000); }
+    catch (error) { pageNotice().replaceChildren(notice(error.message, "error")); event.target.disabled = false; }
+  } }, label);
+  let status;
+  const actions = [el("button", { onclick: () => loadUpdates(true) }, "Check Now")];
+  if (u.state === "installing") status = "Downloading and checking the update…";
+  else if (u.state === "installed") { status = u.message; actions.push(act("/api/update/restart", "Restart Openviz")); }
+  else if (u.available) {
+    status = `Openviz ${named(u.latest)} is available.`;
+    actions.push(u.can_install ? act("/api/update/install", "Update Now") : el("a", { class: "button primary", href: u.page, target: "_blank", rel: "noopener" }, "Open Download Page"));
+  } else status = u.latest ? "This is the newest release." : u.checked ? "No release was found on GitHub." : "Not checked yet.";
+  put(holder, el("div", { class: "group" },
+    setting(`Openviz ${named(u.current)}`, el("span", {}, status,
+      u.state === "failed" ? el("span", { class: "bad" }, u.message) : u.message && u.state !== "installed" ? el("span", {}, u.message) : null,
+      u.available && u.why_not && u.state !== "installed" ? el("span", {}, u.why_not) : null), actions),
+    setting("Check for Updates", "Each time Openviz opens it looks on GitHub for a newer release. Nothing is installed until you choose Update Now.",
+      toggle("update_check", "Check for updates", renderSystem))));
+}
+
+// Beside the version in the sidebar while a newer release is out.
+function markUpdate(u) {
+  const label = $("version");
+  if (!label) return;
+  label.replaceChildren(state.version || "0.1 beta");
+  label.classList.toggle("update", !!u.available);
+  label.title = u.available ? `Openviz ${u.latest.replace(/-/g, " ")} is available: see System` : "";
+  label.onclick = u.available ? () => go("system") : null;
+}
+
+// The setup list: what this computer needs, in the order it is to be done, each step ticked off
+// once it is there. It looks again every few seconds while the page is open, so an install
+// finished elsewhere (the App Store, the Epic Games Launcher) shows up by itself.
+async function loadSetup(fresh) {
+  clearTimeout(setupTimer);
+  let answer;
+  try { answer = await api(`/api/setup${fresh ? "?fresh=1" : ""}`); } catch (error) { return; }
+  renderSetup(answer);
+  if (route.view === "system" && answer.done < answer.total) setupTimer = setTimeout(loadSetup, 4000);
+}
+
+function renderSetup(answer) {
+  state.setup = { done: answer.done, total: answer.total, left: answer.left, kind: answer.kind };
+  markSetup();
+  const holder = $("setup");
+  if (!holder) return;
+  const named = (key) => answer.items.find((entry) => entry.key === key);
+  const head = $("setup-head");
+  head.replaceChildren("Setup", el("span", { class: `badge ${answer.done === answer.total ? "good" : "warn"}` },
+    answer.done === answer.total ? "Complete" : `${answer.done} of ${answer.total} done`),
+    el("button", { class: "small", onclick: () => loadSetup(true) }, "Check Again"));
+  put(holder, el("div", { class: "group setup" }, answer.items.map((item, index) => {
+    const waiting = item.after.filter((key) => named(key) && !named(key).ok).map((key) => named(key).name);
+    let control;
+    if (item.ok) control = el("span", { class: "badge good" }, icon("check"), "Done");
+    else if (item.working) control = el("span", { class: "badge info" }, item.action && item.action.kind === "build" ? "Building…" : "Working…");
+    else if (item.action) {
+      control = el("button", { class: waiting.length ? "" : "primary", disabled: waiting.length > 0, title: waiting.length ? `First: ${waiting.join(", ")}` : "",
+        onclick: async (event) => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          try { renderSetup(await api("/api/setup/act", { json: { key: item.key } })); clearTimeout(setupTimer); setupTimer = setTimeout(loadSetup, 2000); }
+          catch (error) { pageNotice().replaceChildren(notice(error.message, "error")); button.disabled = false; }
+        } }, item.action.label);
+    } else control = el("span", { class: "badge warn" }, "Missing");
+    return el("div", { class: `setting step${item.ok ? " done" : ""}` },
+      el("span", { class: `mark${item.ok ? " ok" : ""}` }, item.ok ? icon("check") : String(index + 1)),
+      el("div", { class: "what" }, el("b", {}, item.name, item.optional ? el("span", { class: "faint" }, " · optional") : null),
+        el("span", {}, item.why), item.detail && !item.ok ? el("span", { class: "detail" }, item.detail) : null,
+        waiting.length && !item.ok ? el("span", { class: "detail" }, `After: ${waiting.join(", ")}.`) : null),
+      el("div", { class: "control" }, control));
+  })));
+}
+
+// The sidebar's mark beside System: red while the setup has steps left.
+function markSetup() {
+  const dot = $("engine-dot");
+  if (!dot) return;
+  const left = state.setup ? state.setup.left : [];
+  dot.classList.toggle("off", left.length > 0 || !!ready());
+  dot.title = left.length ? `Setup: ${left.join(", ")} still to do` : "";
 }
 
 // ------------------------------------------------------------------------------------- parity
@@ -2904,7 +3008,8 @@ async function start() {
   $("build-fixture").replaceChildren(icon("plus"), "New Fixture Type");
   // With a window of its own (Windows), Openviz ends when the page has gone: this says it has not.
   setInterval(() => { api("/api/here").catch(() => {}); }, 30000);
-  $("engine-dot").classList.toggle("off", !!ready());
+  markSetup();
+  api("/api/update").then(markUpdate).catch(() => {});
   warnIfStale();
 
   const file = $("file");

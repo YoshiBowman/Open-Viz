@@ -22,6 +22,8 @@
 	<string>12.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Openviz receives your lighting console's DMX (Art-Net and sACN), and finds NDI streams and MVR-xchange stations on your network.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

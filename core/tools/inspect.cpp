@@ -1858,6 +1858,9 @@ int state_of(const std::string& path, const std::string& mode_name, const std::v
                     beam.color.b, beam.beam_angle, beam.field_angle, field(gobo_name).c_str(), gobo.degrees_per_second,
                     prism.slot ? field(prism.slot->name).c_str() : "-", prism.slot ? prism_images(*prism.slot).size() : size_t(0), beam.iris, beam.frost,
                     beam.defocus, beam.wheel ? field(beam.wheel->name).c_str() : "-");
+        // How the first gobo and the first prism stand and turn: degrees, degrees a second, and the gobo's shake.
+        std::printf("gate\t%s\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n", field(model.geometry()[static_cast<size_t>(beam.geometry)].name).c_str(), gobo.degrees,
+                    gobo.degrees_per_second, gobo.shake_hz, prism.degrees, prism.degrees_per_second);
     }
     return 0;
 }
