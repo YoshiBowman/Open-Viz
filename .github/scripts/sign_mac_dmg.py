@@ -8,7 +8,8 @@ and checks that Gatekeeper accepts the disk image and the app in it. Openviz's u
 app signed by the same team and accepted by Gatekeeper (launcher/updater.py).
 
     python3 sign_mac_dmg.py <in.dmg> <out.dmg> --identity <name> [--keychain <path>]
-                            --key <AuthKey.p8> --key-id <id> --issuer <id>
+                            --key <AuthKey.p8> --key-id <id> --issuer <id>        (an App Store Connect API key)
+                            or --apple-id <email> --team-id <id>, the app-specific password in NOTARY_APP_PASSWORD
     python3 sign_mac_dmg.py <in.dmg> <out.dmg> --identity - --no-notarize     (to try it without secrets)
 
 Standard library only.
@@ -58,9 +59,9 @@ def sign(path, identity, keychain="", program=True):
     run(command + [path])
 
 
-def notarize(disk, key, key_id, issuer):
+def notarize(disk, credentials):
+    """`credentials`: notarytool's own options, an API key's or an Apple ID's."""
     print("Notarizing with Apple (a few minutes)...", flush=True)
-    credentials = ["--key", key, "--key-id", key_id, "--issuer", issuer]
     done = subprocess.run(["xcrun", "notarytool", "submit", disk, *credentials, "--wait", "--output-format", "json"], capture_output=True, text=True)
     try:
         answer = json.loads(done.stdout or "{}")
@@ -81,10 +82,17 @@ def main(argv=None):
     p.add_argument("--key", help="the App Store Connect API key (.p8)")
     p.add_argument("--key-id")
     p.add_argument("--issuer")
+    p.add_argument("--apple-id", help="the developer account's Apple ID, with --team-id and the app-specific password in NOTARY_APP_PASSWORD")
+    p.add_argument("--team-id")
     p.add_argument("--no-notarize", action="store_true")
     args = p.parse_args(argv)
-    if not args.no_notarize and not (args.key and args.key_id and args.issuer):
-        p.error("notarizing needs --key, --key-id and --issuer (or --no-notarize)")
+    password = os.environ.get("NOTARY_APP_PASSWORD", "")
+    if args.key and args.key_id and args.issuer:
+        credentials = ["--key", args.key, "--key-id", args.key_id, "--issuer", args.issuer]
+    elif args.apple_id and args.team_id and password:
+        credentials = ["--apple-id", args.apple_id, "--team-id", args.team_id, "--password", password]
+    elif not args.no_notarize:
+        p.error("notarizing needs --key, --key-id and --issuer, or --apple-id and --team-id with NOTARY_APP_PASSWORD set (or --no-notarize)")
 
     work = tempfile.mkdtemp(prefix="openviz-sign-")
     try:
@@ -114,7 +122,7 @@ def main(argv=None):
         sign(args.target, args.identity, args.keychain, program=False)
 
         if not args.no_notarize:
-            notarize(args.target, args.key, args.key_id, args.issuer)
+            notarize(args.target, credentials)
             run(["spctl", "--assess", "--type", "open", "--context", "context:primary-signature", args.target])
             run(["hdiutil", "attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mount, args.target])
             try:

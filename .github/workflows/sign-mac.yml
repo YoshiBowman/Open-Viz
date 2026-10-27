@@ -8,9 +8,14 @@
 # Repository secrets (Settings, Secrets and variables, Actions; set with gh secret set, SETUP.md 7):
 #   MAC_CERTIFICATE_P12        the Developer ID Application certificate with its private key, exported as .p12, in base64
 #   MAC_CERTIFICATE_PASSWORD   the password the .p12 was exported with
-#   NOTARY_KEY_P8              an App Store Connect API key (the .p8 file's text), for notarization
+#   for notarizing, either an App Store Connect API key:
+#   NOTARY_KEY_P8              the key's .p8 file's text
 #   NOTARY_KEY_ID              its Key ID
 #   NOTARY_ISSUER_ID           its Issuer ID
+#   or the developer account's Apple ID (used when these are set):
+#   NOTARY_APPLE_ID            the Apple ID
+#   NOTARY_APP_PASSWORD        an app-specific password made for it
+#   NOTARY_TEAM_ID             the team's ID, in brackets in the certificate's name
 name: Sign the Mac release
 
 on:
@@ -69,27 +74,45 @@ jobs:
           KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
           KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_APP_PASSWORD: ${{ secrets.NOTARY_APP_PASSWORD }}
+          TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
         run: |
-          if [ -z "$KEY_P8" ] || [ -z "$KEY_ID" ] || [ -z "$ISSUER" ]; then echo "::error::The NOTARY_ secrets are not all set (SETUP.md, section 7)"; exit 1; fi
-          # Copied text often brings a space or a line break along: those go. Then each is checked for its shape,
-          # saying what is wrong without showing it.
-          KEY_ID="$(printf '%s' "$KEY_ID" | tr -d '[:space:]')"
-          ISSUER="$(printf '%s' "$ISSUER" | tr -d '[:space:]')"
-          if ! printf '%s' "$ISSUER" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
-            echo "::error::NOTARY_ISSUER_ID is ${#ISSUER} characters and not a UUID. It is the Issuer ID shown above the keys on App Store Connect, Users and Access, Integrations, Team Keys: 36 characters such as 69a6de7f-1234-47e3-e053-5b8c7c11a4d1"; exit 1
+          # Copied text often brings a space or a line break along: those go. Then each value is checked for
+          # its shape, saying what is wrong without showing it.
+          tidy() { printf '%s' "$1" | tr -d '[:space:]'; }
+          KEY_ID="$(tidy "$KEY_ID")"; ISSUER="$(tidy "$ISSUER")"; APPLE_ID="$(tidy "$APPLE_ID")"; TEAM_ID="$(tidy "$TEAM_ID")"
+          if [ -n "$APPLE_ID" ] || [ -n "$TEAM_ID" ] || [ -n "$NOTARY_APP_PASSWORD" ]; then
+            # The developer account's Apple ID with an app-specific password: any developer account can.
+            if [ -z "$APPLE_ID" ] || [ -z "$TEAM_ID" ] || [ -z "$NOTARY_APP_PASSWORD" ]; then
+              echo "::error::For notarizing by Apple ID, all three of NOTARY_APPLE_ID, NOTARY_APP_PASSWORD and NOTARY_TEAM_ID are needed (SETUP.md, section 7)"; exit 1
+            fi
+            case "$APPLE_ID" in *@*.*) ;; *) echo "::error::NOTARY_APPLE_ID is ${#APPLE_ID} characters and no email address: it is the developer account's Apple ID"; exit 1 ;; esac
+            if ! printf '%s' "$TEAM_ID" | grep -Eq '^[A-Z0-9]{10}$'; then
+              echo "::error::NOTARY_TEAM_ID is ${#TEAM_ID} characters. It is the 10 capital letters and digits in brackets in the certificate's name, Developer ID Application: ... (TEAMID)"; exit 1
+            fi
+            NOTARY="--apple-id $APPLE_ID --team-id $TEAM_ID"
+          else
+            # An App Store Connect API key.
+            if [ -z "$KEY_P8" ] || [ -z "$KEY_ID" ] || [ -z "$ISSUER" ]; then echo "::error::Neither way of notarizing has all its secrets (SETUP.md, section 7)"; exit 1; fi
+            if ! printf '%s' "$ISSUER" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'; then
+              echo "::error::NOTARY_ISSUER_ID is ${#ISSUER} characters and not a UUID. It is the Issuer ID shown above the keys on App Store Connect, Users and Access, Integrations, Team Keys: 36 characters such as 69a6de7f-1234-47e3-e053-5b8c7c11a4d1"; exit 1
+            fi
+            if ! printf '%s' "$KEY_ID" | grep -Eq '^[A-Za-z0-9]{8,14}$'; then
+              echo "::error::NOTARY_KEY_ID is ${#KEY_ID} characters. It is the Key ID in the key's row on the same page: about 10 letters and digits"; exit 1
+            fi
+            if ! printf '%s' "$KEY_P8" | grep -q "BEGIN PRIVATE KEY"; then
+              echo "::error::NOTARY_KEY_P8 is not the text of a .p8 key file (AuthKey_<Key ID>.p8, downloaded once from that page)"; exit 1
+            fi
+            printf '%s\n' "$KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+            NOTARY="--key $RUNNER_TEMP/AuthKey.p8 --key-id $KEY_ID --issuer $ISSUER"
           fi
-          if ! printf '%s' "$KEY_ID" | grep -Eq '^[A-Za-z0-9]{8,14}$'; then
-            echo "::error::NOTARY_KEY_ID is ${#KEY_ID} characters. It is the Key ID in the key's row on the same page: about 10 letters and digits"; exit 1
-          fi
-          if ! printf '%s' "$KEY_P8" | grep -q "BEGIN PRIVATE KEY"; then
-            echo "::error::NOTARY_KEY_P8 is not the text of a .p8 key file (AuthKey_<Key ID>.p8, downloaded once from that page)"; exit 1
-          fi
-          printf '%s\n' "$KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
           IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)"
           if [ -z "$IDENTITY" ]; then echo "::error::MAC_CERTIFICATE_P12 holds no Developer ID Application certificate with its key"; exit 1; fi
+          echo "Signing with $IDENTITY"
           DMG="$(ls work/Openviz-*-Mac.dmg)"
-          python3 .github/scripts/sign_mac_dmg.py "$DMG" work/signed.dmg --identity "$IDENTITY" --keychain "$KEYCHAIN" \
-            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$KEY_ID" --issuer "$ISSUER"
+          # $NOTARY holds no spaces within a value: an email, ids and a path under the runner's temporary folder.
+          python3 .github/scripts/sign_mac_dmg.py "$DMG" work/signed.dmg --identity "$IDENTITY" --keychain "$KEYCHAIN" $NOTARY
           mv work/signed.dmg "$DMG"
           rm -f "$RUNNER_TEMP/AuthKey.p8"
 
