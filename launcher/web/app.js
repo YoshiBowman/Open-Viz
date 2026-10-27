@@ -1590,10 +1590,22 @@ function piecesPanel(name) {
 // A show's screens: the video screens its MVR has, and screens added here. Each shows a test
 // pattern, a picture, a film, an NDI stream or DMX pixels. What is chosen is kept beside the show,
 // and a show that is open takes it up at once.
+// The NDI streams on the network, as last looked for: shared by every Screens tab, looked for again after a minute.
+const ndiFound = { streams: null, at: 0, looking: null };
+function findStreams(again) {
+  if (ndiFound.looking) return ndiFound.looking;
+  if (!again && ndiFound.streams && Date.now() - ndiFound.at < 60000) return Promise.resolve(ndiFound.streams);
+  ndiFound.looking = api("/api/ndi")
+    .then((answer) => { ndiFound.streams = answer.sources; ndiFound.at = Date.now(); return ndiFound.streams; })
+    .finally(() => { ndiFound.looking = null; });
+  return ndiFound.looking;
+}
+
 function screensPanel(name) {
   const panel = el("div", {}, el("p", { class: "muted" }, "Loading screens…"));
   const said = el("div");
-  let streams = [];    // the NDI streams found when last searched
+  let pickers = [];    // the Stream menus on the panel, each filled again when streams have been looked for
+  const refill = () => { for (const fill of pickers) fill(); };
   // What the visualizer says about each screen while this show is open: "playing ...", "waiting for ...".
   const word = {};
   let wordTimer = null;
@@ -1620,9 +1632,15 @@ function screensPanel(name) {
   };
 
   const length = (mm) => (mm / 1000).toFixed(2);
+  // After a change: the page may have been built again meanwhile (the window came back to the front while a
+  // dialog was open), and then it is that page's panel that has to show it.
+  const redraw = (answer) => { draw(answer); if (!panel.isConnected) loadShows(); };
   const draw = (answer) => {
+    pickers = [];
+    // A screen shows an NDI stream: its menu lists the streams on the network, looked for in the background.
+    if (answer.screens.some((one) => [one, ...one.sections].some((part) => part.source === "ndi"))) findStreams().then(refill, () => {});
     const change = async (id, changes) => {
-      try { draw(await api("/api/screen/set", { json: { name, id, changes } })); said.replaceChildren(); }
+      try { redraw(await api("/api/screen/set", { json: { name, id, changes } })); said.replaceChildren(); }
       catch (error) { said.replaceChildren(notice(error.message, "error")); }
     };
     const field = (text, control) => el("label", { class: "field" }, el("span", {}, text), control);
@@ -1646,15 +1664,37 @@ function screensPanel(name) {
           if (chosen.path) await send({ value: chosen.path });
         }, said) }, "Browse…"))));
       } else if (target.source === "ndi") {
-        const listId = `ndi-${screen.id}-${label.length}`;
-        const list = el("datalist", { id: listId }, streams.map((stream) => el("option", { value: stream })));
-        const box = el("input", { type: "text", class: "mid", value: target.value, list: listId, placeholder: "COMPUTER (Stream)", "aria-label": `NDI stream for ${label}`,
-          onchange: (event) => send({ value: event.target.value }) });
-        controls.push(field("Stream", el("span", { class: "badges" }, box, list, el("button", { onclick: busy(null, async () => {
-          streams = (await api("/api/ndi")).sources;
-          list.replaceChildren(...streams.map((stream) => el("option", { value: stream })));
-          said.replaceChildren(notice(streams.length ? "NDI streams on the network: " : "No NDI streams are being sent on the network right now.", streams.length ? "ok" : "info",
-            ...streams.map((stream, index) => [index ? ", " : "", el("button", { class: "link", onclick: () => send({ value: stream }) }, stream)])));
+        // The streams found on the network, the one chosen if it is not among them, and a name typed by hand
+        // for a stream not sent yet.
+        const OTHER = "\u0000other";
+        const picker = el("select", { class: "mid", "aria-label": `NDI stream for ${label}`, onchange: () => {
+          if (picker.value === OTHER) {
+            picker.value = target.value;
+            typedName.hidden = false;
+            typedName.focus();
+            return;
+          }
+          if (picker.value && picker.value !== target.value) send({ value: picker.value });
+        } });
+        const fill = () => {
+          const found = ndiFound.streams || [];
+          const waiting = !ndiFound.streams || ndiFound.looking;
+          put(picker,
+            target.value ? null : el("option", { value: "", selected: true, disabled: true }, waiting ? "Looking for Streams…" : found.length ? "Choose a Stream" : "No Streams Found"),
+            found.map((stream) => el("option", { value: stream, selected: stream === target.value }, stream)),
+            target.value && !found.includes(target.value) ? el("option", { value: target.value, selected: true }, waiting ? target.value : `${target.value} (not found)`) : null,
+            el("option", { value: OTHER }, "Enter Name…"));
+        };
+        fill();
+        pickers.push(fill);
+        const typedName = el("input", { type: "text", class: "mid", hidden: true, value: target.value, placeholder: "COMPUTER (Stream)", "aria-label": `NDI stream name for ${label}`,
+          onchange: (event) => { if (event.target.value.trim()) send({ value: event.target.value.trim() }); } });
+        controls.push(field("Stream", el("span", { class: "badges" }, picker, typedName, el("button", { title: "Look for NDI streams on the network again", onclick: busy(null, async () => {
+          const looking = findStreams(true);
+          refill();
+          const streams = await looking;
+          refill();
+          said.replaceChildren(streams.length ? "" : notice("No NDI streams are being sent on the network right now.", "info"));
           // A stream the show names that is not there, and one that is called nearly the same: every screen showing it, in one go.
           const plain = (text) => text.toLowerCase().replace(/[^a-z0-9]/g, "");
           const named = new Set(answer.screens.flatMap((one) => [one, ...one.sections]).filter((one) => one.source === "ndi" && one.value).map((one) => one.value));
@@ -1662,11 +1702,11 @@ function screensPanel(name) {
             const near = streams.filter((stream) => plain(stream).includes(plain(missing).replace(/^.*?(mix|out)/, "$1")) || plain(stream) === plain(missing));
             said.append(notice(`${missing} is not on the network. `, "info", near.length === 1
               ? el("button", { class: "link", onclick: busy(null, async () => {
-                draw(await api("/api/screen/stream", { json: { name, old: missing, new: near[0] } }));
+                redraw(await api("/api/screen/stream", { json: { name, old: missing, new: near[0] } }));
                 said.replaceChildren(notice(`Every screen that showed ${missing} now shows ${near[0]}.`, "ok"));
               }, said) }, `Use ${near[0]} on every screen that shows it`) : "Is its sender on, and on this network?"));
           }
-        }, said) }, "Find Streams"))));
+        }, said) }, "Refresh"))));
       } else if (target.source === "pixels" && target.pixels) {
         // An LED strip or a low-resolution wall: its pixels take their levels from DMX, in order, from an address on.
         const map = target.pixels;
@@ -1684,21 +1724,32 @@ function screensPanel(name) {
           field("Wiring", pick("wiring", "Wiring", [["rows", "Rows, left to right"], ["snake", "Rows, snake"], ["columns", "Columns, top to bottom"], ["snake-columns", "Columns, snake"]])));
       }
       if (["picture", "film", "ndi"].includes(target.source)) {
-        // Which part of the picture: all of it, or a part, so that one picture can be spread over several screens or sections.
+        // Which part of the picture: all of it, a half, a section's share of the screen's picture (so that one
+        // picture spreads over the sections), or any other part, drawn on the picture or typed in pixels (Custom).
         const same = (one, other) => one.every((edge, index) => Math.abs(edge - other[index]) < 0.0005);
-        const parts = [["whole", "Whole picture", [0, 0, 1, 1]]];
-        if (target.own) parts.unshift(["own", "Its part of the screen's picture", target.own]);
-        parts.push(["left", "Left half", [0, 0, 0.5, 1]], ["right", "Right half", [0.5, 0, 1, 1]], ["top", "Top half", [0, 0, 1, 0.5]], ["bottom", "Bottom half", [0, 0.5, 1, 1]]);
-        // A part laid out turned in the picture, as an LED processor's map has it, is shown as such; choosing another replaces it.
-        if (target.map) parts.unshift(["mapped", "Its mapped part (turned)", null]);
-        const now = target.map ? parts[0] : parts.find((entry) => same(entry[2], target.part));
-        const percent = (edge) => `${+(edge * 100).toFixed(1)}%`;
-        controls.push(field("Crop", el("select", { "aria-label": `Which part of its picture ${label} shows`, onchange: (event) => {
+        const parts = [["whole", "Whole Picture", [0, 0, 1, 1]]];
+        if (target.own) parts.unshift(["own", "Section's Share", target.own]);
+        parts.push(["left", "Left Half", [0, 0, 0.5, 1]], ["right", "Right Half", [0.5, 0, 1, 1]]);
+        const now = target.map ? null : parts.find((entry) => same(entry[2], target.part));    // none: a custom part, or a map's
+        // What else shows this picture or stream, to be seen (and snapped to) in the crop window.
+        const others = answer.screens.flatMap((one) => one.sections.length
+          ? one.sections.map((part, index) => ({ label: `${one.name}, section ${index + 1}`, target: part }))
+          : [{ label: one.name, target: one }])
+          .filter((one) => one.target !== target && one.target.source === target.source && one.target.value === target.value && target.value)
+          .map((one) => ({ label: one.label, part: one.target.part, map: one.target.map }));
+        const custom = () => partDialog(name, screen, target, label, extent, send, others);
+        const crop = el("select", { "aria-label": `Which part of its picture ${label} shows`, onchange: (event) => {
           const chosen = parts.find((entry) => entry[0] === event.target.value);
-          if (chosen && chosen[0] === "mapped") return;
-          if (chosen) send({ part: chosen[0] === "own" || chosen[0] === "whole" ? (target.own ? chosen[0] : chosen[2]) : chosen[2] });
+          if (!chosen) {
+            event.target.value = now ? now[0] : "custom";    // as it is until the dialog's Apply
+            custom();
+            return;
+          }
+          send({ part: chosen[0] === "own" || chosen[0] === "whole" ? (target.own ? chosen[0] : chosen[2]) : chosen[2] });
         } }, parts.map((entry) => el("option", { value: entry[0], selected: entry === now }, entry[1])),
-          now ? null : el("option", { value: "other", selected: true }, `${percent(target.part[0])}, ${percent(target.part[1])} to ${percent(target.part[2])}, ${percent(target.part[3])}`))));
+          el("option", { value: "custom", selected: !now }, now ? "Custom…" : "Custom"));
+        const edit = now ? null : el("button", { class: "small", onclick: custom }, "Edit…");
+        controls.push(field("Crop", el("span", { class: "badges" }, crop, edit)));
       }
       if (target.source !== "off" && target.source !== "fixtures") {
         controls.push(field("Brightness (nits)", el("input", { type: "number", class: "narrow", min: "0", max: "10000", step: "50", value: String(Math.round(target.nits)),
@@ -1725,7 +1776,7 @@ function screensPanel(name) {
         screen.sections.forEach((section, index) => {
           const label = `${title}, section ${index + 1}`;
           const send = async (changes) => {
-            try { draw(await api("/api/screen/section", { json: { name, id: screen.id, section: index, changes } })); said.replaceChildren(); }
+            try { redraw(await api("/api/screen/section", { json: { name, id: screen.id, section: index, changes } })); said.replaceChildren(); }
             catch (error) { said.replaceChildren(notice(error.message, "error")); }
           };
           block.append(el("div", { class: "section-block" },
@@ -1739,7 +1790,7 @@ function screensPanel(name) {
       const columns = el("input", { type: "number", class: "narrow", min: "1", max: String(answer.max_split), step: "1", value: String(screen.columns || 2), "aria-label": `Sections across ${title}` });
       const rows = el("input", { type: "number", class: "narrow", min: "1", max: String(answer.max_split), step: "1", value: String(screen.rows || 1), "aria-label": `Sections down ${title}` });
       const cut = async (across, down) => {
-        try { draw(await api("/api/screen/split", { json: { name, id: screen.id, columns: across, rows: down } })); said.replaceChildren(); }
+        try { redraw(await api("/api/screen/split", { json: { name, id: screen.id, columns: across, rows: down } })); said.replaceChildren(); }
         catch (error) { said.replaceChildren(notice(error.message, "error")); }
       };
       block.append(el("div", { class: "fields tight" },
@@ -1762,7 +1813,7 @@ function screensPanel(name) {
           el("p", { class: "help" }, wall ? "This screen covers the fixtures it replaces. While it shows its own content, those fixtures are hidden in the visualizer; set to Fixtures, or removed, it gives them back."
             : "Measured from the centre of the stage: X toward stage left, Y upstage, Z the bottom edge. At 0° the screen faces the house; positive rotation is counter-clockwise seen from above."),
           el("button", { class: "small subtle danger", onclick: async () => {
-            try { draw(await api("/api/screen/remove", { json: { name, id: screen.id } })); said.replaceChildren(); }
+            try { redraw(await api("/api/screen/remove", { json: { name, id: screen.id } })); said.replaceChildren(); }
             catch (error) { said.replaceChildren(notice(error.message, "error")); }
           } }, icon("trash"), wall ? "Remove Screen (Show Fixtures)" : "Remove Screen"));
         block.append(place);
@@ -1778,7 +1829,7 @@ function screensPanel(name) {
         el("span", { class: "muted small-text" }, `${plural(wall.count, "fixture")} of ${typeName(wall.type)} · ${length(wall.width)} × ${length(wall.height)} m`),
         el("span", { class: "grow" }),
         el("button", { class: "small", onclick: busy(null, async () => {
-          draw(await api("/api/screen/wall", { json: { name, fixtures: wall.uuids } }));
+          redraw(await api("/api/screen/wall", { json: { name, fixtures: wall.uuids } }));
           said.replaceChildren();
         }, said) }, "Convert to Screen")))));
     put(panel,
@@ -1786,7 +1837,7 @@ function screensPanel(name) {
         ? "The content of each screen. A show that is open picks up changes immediately; videos restart, and NDI streams take about ten seconds to appear."
         : "This show has no screens yet. The MVR has no video screen with a shape."),
         el("button", { class: "primary", onclick: async () => {
-          try { draw(await api("/api/screen/add", { json: { name } })); said.replaceChildren(); }
+          try { redraw(await api("/api/screen/add", { json: { name } })); said.replaceChildren(); }
           catch (error) { said.replaceChildren(notice(error.message, "error")); }
         } }, icon("plus"), "Add Screen")),
       said,
@@ -2324,6 +2375,452 @@ async function takeAction(path, body, said) {
     if (said) takesNotice = notice(said(answer), "ok");
   } catch (error) { takesNotice = notice(error.message, "error"); }
   loadTakes();
+}
+
+// Custom Crop: a frame of a screen's NDI stream, or its still picture, with the part the screen shows
+// drawn on it (owner, 2026-10-27: "see a preview of the ndi feed and essentially draw out what part of
+// it you want on the screen. also allow you to input the size by pixel. similar to what you can do in
+// resolume"; then "needs a rotation option" and "an undo button for if you mess up the crop"). Drag to
+// draw a part, drag inside it to move it, drag its edges and corners to size it and its round handle to
+// rotate it, or type it in the source's own pixels. An upright part is kept as shares of the picture
+// (`part`), a rotated one as a map (its corner and its steps across and down, as a media server's map is).
+function partDialog(name, screen, target, label, extent, send, others = []) {
+  const section = screen.sections.indexOf(target);
+  const query = `name=${encodeURIComponent(name)}&id=${encodeURIComponent(screen.id)}${section >= 0 ? `&section=${section}` : ""}`;
+  const live = target.source === "ndi";
+  dialog(`Custom Crop · ${label}`, (close) => {
+    let W = 0, H = 0;               // the source's size in pixels, once known
+    let rect = null;                // the part before rotation, in the source's pixels: x, y, w, h
+    let turn = 0;                   // its rotation about its middle, degrees clockwise
+    // A map that is no rotated rectangle (slanted or mirrored) is shown dashed, as it is, until a part replaces it.
+    let mapped = false;
+    let start = null;               // as it was when the window opened: Apply sends nothing if it still is
+    const history = [], future = [];    // Undo and Redo
+    const outline = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    outline.setAttribute("class", "part-map");
+    outline.setAttribute("viewBox", "0 0 100 100");
+    outline.setAttribute("preserveAspectRatio", "none");
+    if (target.map) {
+      const [cx, cy, ax, ay, dx, dy] = target.map;
+      const polygon = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+      polygon.setAttribute("points", [[cx, cy], [cx + ax, cy + ay], [cx + ax + dx, cy + ay + dy], [cx + dx, cy + dy]].map(([x, y]) => `${x * 100},${y * 100}`).join(" "));
+      polygon.setAttribute("vector-effect", "non-scaling-stroke");
+      outline.append(polygon);
+    }
+    // The other screens that show this picture or stream, each where its part lies: to line this one up with them.
+    const corners = (one) => {
+      if (one.map) {
+        const [cx, cy, ax, ay, dx, dy] = one.map;
+        return [[cx, cy], [cx + ax, cy + ay], [cx + ax + dx, cy + ay + dy], [cx + dx, cy + dy]];
+      }
+      const [l, t, r, b] = one.part;
+      return [[l, t], [r, t], [r, b], [l, b]];
+    };
+    const ghosts = el("div", { class: "part-ghosts" });
+    const ghostLines = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    ghostLines.setAttribute("viewBox", "0 0 100 100");
+    ghostLines.setAttribute("preserveAspectRatio", "none");
+    ghosts.append(ghostLines);
+    for (const one of others) {
+      const points = corners(one);
+      const polygon = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+      polygon.setAttribute("points", points.map(([x, y]) => `${x * 100},${y * 100}`).join(" "));
+      polygon.setAttribute("vector-effect", "non-scaling-stroke");
+      ghostLines.append(polygon);
+      const tag = el("span", { class: "part-ghost-name" }, one.label);
+      tag.style.left = `${points.reduce((sum, [x]) => sum + x, 0) / 4 * 100}%`;
+      tag.style.top = `${points.reduce((sum, [, y]) => sum + y, 0) / 4 * 100}%`;
+      ghosts.append(tag);
+    }
+    const guideLines = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    guideLines.setAttribute("class", "part-guides");
+    guideLines.setAttribute("preserveAspectRatio", "none");
+    const showOthers = el("input", { type: "checkbox", checked: true, "aria-label": "Show other screens on this source",
+      onchange: () => { ghosts.hidden = !showOthers.checked; } });
+    const snapping = el("input", { type: "checkbox", checked: true, "aria-label": "Snap to edges" });
+    const pointer = el("span", { class: "muted small-text num part-pointer" });
+    const shape = extent[1] / extent[0];    // the screen's height over its width: an undistorted part has the same
+    const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
+    const said = el("div");
+    const stage = el("div", { class: "part-stage", tabindex: "0", "aria-label": "The picture, with the part on it" });
+    const box = el("div", { class: "part-box" }, ["n", "s", "e", "w", "ne", "nw", "se", "sw", "rot"].map((edge) =>
+      el("span", { class: `handle ${edge}`, "data-edge": edge, title: edge === "rot" ? "Drag to rotate (Shift: in steps of 15°)" : "" })));
+    const number = (key, title, step) => el("input", { type: "number", class: "narrow", step, "aria-label": title, onchange: () => typed(key) });
+    const inputs = { x: number("x", "X, pixels", "1"), y: number("y", "Y, pixels", "1"), w: number("w", "Width, pixels", "1"), h: number("h", "Height, pixels", "1"),
+                     turn: number("turn", "Rotation, degrees", "any") };
+    const lock = el("input", { type: "checkbox", "aria-label": "Keep the screen's shape" });
+    const facts = el("p", { class: "muted small-text" });
+    const undoButton = el("button", { class: "small", disabled: true, title: "Undo (⌘Z)", onclick: () => step(history, future) }, "Undo");
+    const redoButton = el("button", { class: "small", disabled: true, title: "Redo (⇧⌘Z)", onclick: () => step(future, history) }, "Redo");
+    const sizeOf = { w: el("input", { type: "number", class: "narrow", min: "1", step: "1", "aria-label": "Source width, pixels" }),
+                     h: el("input", { type: "number", class: "narrow", min: "1", step: "1", "aria-label": "Source height, pixels" }) };
+    const byHand = el("div", { class: "fields tight", hidden: true },
+      el("label", { class: "field" }, el("span", {}, "Source Width (px)"), sizeOf.w), el("label", { class: "field" }, el("span", {}, "Source Height (px)"), sizeOf.h),
+      el("button", { class: "small", onclick: () => { if (Number(sizeOf.w.value) > 0 && Number(sizeOf.h.value) > 0) known(Math.round(Number(sizeOf.w.value)), Math.round(Number(sizeOf.h.value)), null); } }, "Use This Size"));
+
+    // Geometry: the part's middle, and its own across and down directions at its rotation.
+    const middle = (r) => ({ x: r.x + r.w / 2, y: r.y + r.h / 2 });
+    const axes = (degrees) => {
+      const a = degrees * Math.PI / 180;
+      return { u: { x: Math.cos(a), y: Math.sin(a) }, v: { x: -Math.sin(a), y: Math.cos(a) } };
+    };
+    const upright = () => Math.abs(turn) < 1e-9;
+    const tidyTurn = (degrees) => { const t = ((degrees % 360) + 540) % 360 - 180; return Math.abs(t) < 1e-9 ? 0 : +t.toFixed(2); };
+    function fit(r) {
+      if (upright()) {    // inside the picture, at least a pixel
+        const w = clamp(r.w, 1, W), h = clamp(r.h, 1, H);
+        return { x: clamp(r.x, 0, W - w), y: clamp(r.y, 0, H - h), w, h };
+      }
+      // Rotated, it may reach past the picture's edges (what lies there is black); its middle stays on it.
+      const most = Math.hypot(W, H), w = clamp(r.w, 1, most), h = clamp(r.h, 1, most), c = middle(r);
+      return { x: clamp(c.x, 0, W) - w / 2, y: clamp(c.y, 0, H) - h / 2, w, h };
+    }
+    const whole = (r) => ({ x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.w), h: Math.round(r.h) });
+    // A map read as a rotated rectangle, if it is one: its across and down at right angles and not mirrored.
+    function fromMap(map) {
+      const a = { x: map[2] * W, y: map[3] * H }, d = { x: map[4] * W, y: map[5] * H };
+      const w = Math.hypot(a.x, a.y), h = Math.hypot(d.x, d.y);
+      if (w < 1e-6 || h < 1e-6 || Math.abs((a.x * d.x + a.y * d.y) / (w * h)) > 0.01 || a.x * d.y - a.y * d.x <= 0) return null;
+      const c = { x: map[0] * W + (a.x + d.x) / 2, y: map[1] * H + (a.y + d.y) / 2 };
+      return { rect: { x: c.x - w / 2, y: c.y - h / 2, w, h }, turn: tidyTurn(Math.atan2(a.y, a.x) * 180 / Math.PI) };
+    }
+    function toMap() {
+      const c = middle(rect), { u, v } = axes(turn);
+      const a = { x: u.x * rect.w, y: u.y * rect.w }, d = { x: v.x * rect.h, y: v.y * rect.h };
+      const share = (value) => +value.toFixed(7);
+      return [share((c.x - (a.x + d.x) / 2) / W), share((c.y - (a.y + d.y) / 2) / H), share(a.x / W), share(a.y / H), share(d.x / W), share(d.y / H)];
+    }
+
+    // Undo and Redo: every change keeps what was before it.
+    const snapshot = () => JSON.stringify({ rect, turn, mapped });
+    const restore = (state) => { ({ rect, turn, mapped } = JSON.parse(state)); render(); };
+    function changing(work) {
+      const before = snapshot();
+      work();
+      if (snapshot() !== before) { history.push(before); future.length = 0; }
+      render();
+    }
+    function step(from, to) {
+      if (!from.length) return;
+      to.push(snapshot());
+      restore(from.pop());
+    }
+    let nudged = 0;    // when an arrow key last moved the part: a run of them is one step to undo
+    function onKey(event) {
+      if (!stage.isConnected) { document.removeEventListener("keydown", onKey); return; }
+      if (event.target.tagName === "INPUT" || event.target.tagName === "SELECT") return;
+      const arrow = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[event.key];
+      if (arrow && rect && !mapped && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault();
+        const by = event.shiftKey ? 10 : 1, before = snapshot();
+        rect = fit({ ...rect, x: rect.x + arrow[0] * by, y: rect.y + arrow[1] * by });
+        if (snapshot() !== before && Date.now() - nudged > 1000) { history.push(before); future.length = 0; }
+        nudged = Date.now();
+        render();
+        return;
+      }
+      if (event.key.toLowerCase() !== "z" || !(event.metaKey || event.ctrlKey)) return;
+      event.preventDefault();
+      if (event.shiftKey) step(future, history); else step(history, future);
+    }
+    document.addEventListener("keydown", onKey);
+
+    function render() {
+      undoButton.disabled = !history.length;
+      redoButton.disabled = !future.length;
+      const long = Math.hypot(W, H);
+      guideLines.replaceChildren(...guides.map(({ at, along }) => {
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        for (const [key, value] of Object.entries({ x1: at.x - along.x * long, y1: at.y - along.y * long, x2: at.x + along.x * long, y2: at.y + along.y * long })) line.setAttribute(key, value);
+        line.setAttribute("vector-effect", "non-scaling-stroke");
+        return line;
+      }));
+      if (!rect) return;
+      box.hidden = mapped;
+      outline.style.display = mapped ? "" : "none";
+      if (mapped) {
+        for (const key of Object.keys(inputs)) inputs[key].value = "";
+        facts.replaceChildren("Now: a part from a media server's map that is slanted or mirrored (dashed). Drawing or typing a part replaces it.");
+        return;
+      }
+      Object.assign(box.style, { left: `${rect.x / W * 100}%`, top: `${rect.y / H * 100}%`, width: `${rect.w / W * 100}%`, height: `${rect.h / H * 100}%`,
+        transform: upright() ? "" : `rotate(${turn}deg)` });
+      for (const key of ["x", "y", "w", "h"]) if (document.activeElement !== inputs[key]) inputs[key].value = String(Math.round(rect[key]));
+      if (document.activeElement !== inputs.turn) inputs.turn.value = String(turn);
+      const off = (rect.h / rect.w) / shape - 1;
+      facts.replaceChildren(`Part ${Math.round(rect.w)} × ${Math.round(rect.h)} of ${W} × ${H} pixels${upright() ? "" : `, rotated ${turn}°`}. The screen is ${(extent[0] / 1000).toFixed(2)} × ${(extent[1] / 1000).toFixed(2)} m`,
+        Math.abs(off) > 0.02 ? `: the picture is stretched ${off > 0 ? "across" : "up and down"} by ${Math.round(Math.abs(off) * 100)}% to fit it.` : ", the same shape: nothing is stretched.");
+    }
+    // A typed number; with the screen's shape kept, a width typed sets the height and a height the width.
+    function typed(key) {
+      if (!W) return;
+      changing(() => {
+        mapped = false;
+        if (key === "turn") {
+          const value = Number(inputs.turn.value);
+          if (Number.isFinite(value)) turn = tidyTurn(value);
+          rect = fit(rect);
+          return;
+        }
+        // A field left empty (as they all are while a slanted map is shown) keeps what the part has.
+        const read = (field, otherwise) => (inputs[field].value.trim() !== "" && Number.isFinite(Number(inputs[field].value)) ? Number(inputs[field].value) : otherwise);
+        const r = { x: read("x", rect.x), y: read("y", rect.y), w: read("w", rect.w), h: read("h", rect.h) };
+        if (lock.checked && key === "w") r.h = r.w * shape;
+        if (lock.checked && key === "h") r.w = r.h / shape;
+        if (lock.checked && upright() && (r.w > W || r.h > H)) {    // too large for the picture: the largest of its shape
+          const scale = Math.min(W / r.w, H / r.h);
+          r.w *= scale;
+          r.h *= scale;
+        }
+        rect = whole(fit(r));
+      });
+    }
+    // The screen's shape, about the part's middle, as large as the picture allows.
+    function screenShape(r) {
+      let w = r.w, h = w * shape;
+      if (h > H) { h = H; w = h / shape; }
+      if (w > W) { w = W; h = w * shape; }
+      return fit({ x: r.x + (r.w - w) / 2, y: r.y + (r.h - h) / 2, w, h });
+    }
+    function known(width, height, picture) {
+      const was = rect && W ? { x: rect.x / W, y: rect.y / H, w: rect.w / W, h: rect.h / H } : null;
+      W = width;
+      H = height;
+      const blank = picture ? null : el("div", { class: "part-blank" });
+      if (blank) blank.style.aspectRatio = `${W} / ${H}`;    // set as a property: the page's policy refuses style attributes
+      guideLines.setAttribute("viewBox", `0 0 ${W} ${H}`);
+      stage.replaceChildren(picture || blank, ghosts, outline, box, guideLines);
+      byHand.hidden = true;
+      if (was) {    // a new frame: the part as it was, at the frame's size
+        rect = { x: was.x * W, y: was.y * H, w: was.w * W, h: was.h * H };
+      } else {
+        const read = target.map ? fromMap(target.map) : null;
+        mapped = !!target.map && !read;
+        if (read) ({ rect, turn } = read);
+        else {
+          const part = target.map ? [0, 0, 1, 1] : target.part;
+          rect = whole(fit({ x: part[0] * W, y: part[1] * H, w: (part[2] - part[0]) * W, h: (part[3] - part[1]) * H }));
+        }
+        start = snapshot();
+      }
+      render();
+    }
+    async function frame() {
+      if (target.source === "film") {    // nothing to look at: the part is typed, against the film's size
+        said.replaceChildren(notice("A video file has no preview here. Give its size in pixels, then the part.", "info"));
+        sizeOf.w.value = sizeOf.w.value || "1920";
+        sizeOf.h.value = sizeOf.h.value || "1080";
+        byHand.hidden = false;
+        return;
+      }
+      said.replaceChildren(notice(live ? `Getting a frame from ${target.value}…` : "Opening the picture…", "info"));
+      try {
+        const response = await fetch(`/api/screen/preview?${query}`, { headers: { "X-Launcher-Token": token } });
+        if (!response.ok) {
+          let answer = {};
+          try { answer = await response.json(); } catch (error) { /* not JSON */ }
+          throw new Error(answer.error || `Something went wrong (${response.status}).`);
+        }
+        const url = URL.createObjectURL(await response.blob());
+        const picture = el("img", { alt: "", draggable: "false" });
+        picture.addEventListener("load", () => { known(picture.naturalWidth, picture.naturalHeight, picture); said.replaceChildren(); }, { once: true });
+        picture.src = url;
+      } catch (error) {
+        said.replaceChildren(notice(`${error.message} The part can still be given in pixels: say the source's size.`, "error"));
+        if (!W) byHand.hidden = false;
+      }
+    }
+
+    // Dragging: on the part moves it, on a handle sizes or rotates it, anywhere else draws a new one. All of
+    // it is worked out along the part's own across and down, so it holds at any rotation.
+    let drag = null;
+    const at = (event) => {
+      const area = stage.getBoundingClientRect();
+      return { x: clamp((event.clientX - area.left) / area.width * W, 0, W), y: clamp((event.clientY - area.top) / area.height * H, 0, H) };
+    };
+    // Snapping. The places snapped to: the picture's corners, the middles of its edges and its middle, and the
+    // same of every other screen's part on this source (2026-10-27: upright only at first, so the owner's
+    // diamond strips, all rotated, never snapped). The part's edges and middle snap along its own across and
+    // down onto lines through those places parallel to its edges: upright, onto the picture's edges and the
+    // upright parts'; rotated, onto the edges of parts at its rotation. Each snap is drawn as a guide line.
+    const places = () => {
+      const found = [[0, 0], [W / 2, 0], [W, 0], [0, H / 2], [W / 2, H / 2], [W, H / 2], [0, H], [W / 2, H], [W, H]];
+      if (showOthers.checked) {
+        for (const one of others) {
+          const p = corners(one).map(([x, y]) => [x * W, y * H]);
+          p.forEach((q, i) => { const n = p[(i + 1) % 4]; found.push(q, [(q[0] + n[0]) / 2, (q[1] + n[1]) / 2]); });
+          found.push([(p[0][0] + p[2][0]) / 2, (p[0][1] + p[2][1]) / 2]);
+        }
+      }
+      return found.map(([x, y]) => ({ x, y }));
+    };
+    const reach = () => 8 * W / stage.getBoundingClientRect().width;    // 8 pixels of the window, in the source's
+    const snaps = (event) => snapping.checked && !event.altKey;          // Option (Alt) held: free
+    let guides = [];    // the snaps made: lines through a place, along a direction
+    // How far to go along `axis` so that one of `values` (places along it, measured from `origin`) meets the
+    // line through a place square to the axis: { by, at }, or null if none is near enough.
+    function nearest(values, axis, origin) {
+      let best = null, gap = reach();
+      for (const place of places()) {
+        const t = (place.x - origin.x) * axis.x + (place.y - origin.y) * axis.y;
+        for (const value of values) if (Math.abs(t - value) < gap) { gap = Math.abs(t - value); best = { by: t - value, at: place }; }
+      }
+      return best;
+    }
+    // A point snapped along the part's across and down.
+    function snapPoint(p) {
+      const { u, v } = axes(turn);
+      let q = { ...p };
+      for (const [axis, other] of [[u, v], [v, u]]) {
+        const found = nearest([0], axis, q);
+        if (found) { q = { x: q.x + axis.x * found.by, y: q.y + axis.y * found.by }; guides.push({ at: found.at, along: other }); }
+      }
+      return q;
+    }
+    // Rotation snaps to every 45° and to the other parts' rotations (and square to them).
+    function snapTurn(degrees) {
+      const angles = [-180, -135, -90, -45, 0, 45, 90, 135, 180];
+      if (showOthers.checked) {
+        for (const one of others) {
+          const [[x0, y0], [x1, y1]] = corners(one);
+          const a = Math.atan2((y1 - y0) * H, (x1 - x0) * W) * 180 / Math.PI;
+          angles.push(a, a + 90, a - 90, a + 180, a - 180);
+        }
+      }
+      let best = degrees, gap = 2.5;
+      for (const a of angles) if (Math.abs(a - degrees) < gap) { gap = Math.abs(a - degrees); best = a; }
+      return best;
+    }
+    stage.addEventListener("pointerdown", (event) => {
+      if (!W) return;
+      const point = at(event);
+      guides = [];
+      const from = snaps(event) && !event.target.dataset.edge ? snapPoint(point) : point;
+      guides = [];
+      const mode = event.target.dataset.edge || (box.contains(event.target) && !mapped ? "move" : "draw");
+      drag = { mode, from, was: { ...rect }, before: snapshot(), down: { x: event.clientX, y: event.clientY }, moved: false };
+      stage.setPointerCapture(event.pointerId);
+      stage.focus();    // keys (arrows, ⌘Z) go to the part, and Enter or Space no longer reach the window's buttons
+      event.preventDefault();
+    });
+    stage.addEventListener("pointermove", (event) => {
+      const point = at(event);
+      if (W) pointer.textContent = `${Math.round(point.x)}, ${Math.round(point.y)} px`;
+      if (!drag) return;
+      // A click is no drag: nothing changes until the pointer has moved a few pixels.
+      if (!drag.moved && Math.hypot(event.clientX - drag.down.x, event.clientY - drag.down.y) < 4) return;
+      drag.moved = true;
+      mapped = false;
+      guides = [];
+      const snap = snaps(event);
+      // A part being drawn: its far corner onto a line near it.
+      const now = snap && drag.mode === "draw" ? snapPoint(point) : point;
+      const was = drag.was, c = middle(was), { u, v } = axes(turn);
+      const along = (p, axis) => (p.x - c.x) * axis.x + (p.y - c.y) * axis.y;
+      let r;
+      if (drag.mode === "rot") {
+        const degrees = Math.atan2(now.y - c.y, now.x - c.x) * 180 / Math.PI + 90;
+        turn = tidyTurn(event.shiftKey ? Math.round(degrees / 15) * 15 : snap ? snapTurn(degrees) : Math.round(degrees * 10) / 10);
+        r = was;
+      } else if (drag.mode === "move") {
+        r = { ...was, x: was.x + now.x - drag.from.x, y: was.y + now.y - drag.from.y };
+        if (snap) {    // its edges or its middle, along its own across and down, onto a line through a place
+          for (const [axis, other, half] of [[u, v, r.w / 2], [v, u, r.h / 2]]) {
+            const found = nearest([-half, 0, half], axis, middle(r));
+            if (found) { r.x += axis.x * found.by; r.y += axis.y * found.by; guides.push({ at: found.at, along: other }); }
+          }
+        }
+      } else if (drag.mode === "draw") {
+        const d = { x: now.x - drag.from.x, y: now.y - drag.from.y };
+        const du = d.x * u.x + d.y * u.y, dv = d.x * v.x + d.y * v.y;
+        const w = Math.abs(du), h = lock.checked ? w * shape : Math.abs(dv);
+        const mid = { x: drag.from.x + (Math.sign(du) * u.x * w + (Math.sign(dv) || 1) * v.x * h) / 2,
+                      y: drag.from.y + (Math.sign(du) * u.y * w + (Math.sign(dv) || 1) * v.y * h) / 2 };
+        r = { x: mid.x - w / 2, y: mid.y - h / 2, w, h };
+      } else {
+        // An edge or a corner, in the part's own terms: the opposite edge stays where it is.
+        let left = -was.w / 2, right = was.w / 2, top = -was.h / 2, bottom = was.h / 2;
+        const lu = along(now, u), lv = along(now, v);
+        if (drag.mode.includes("w")) left = Math.min(lu, right - 1);
+        if (drag.mode.includes("e")) right = Math.max(lu, left + 1);
+        if (drag.mode.includes("n")) top = Math.min(lv, bottom - 1);
+        if (drag.mode.includes("s")) bottom = Math.max(lv, top + 1);
+        if (snap) {    // the edges being dragged onto a line through a place, parallel to them
+          const edge = (value, axis, other) => {
+            const found = nearest([value], axis, c);
+            if (!found) return value;
+            guides.push({ at: found.at, along: other });
+            return value + found.by;
+          };
+          if (drag.mode.includes("w")) left = Math.min(edge(left, u, v), right - 1);
+          if (drag.mode.includes("e")) right = Math.max(edge(right, u, v), left + 1);
+          if (drag.mode.includes("n")) top = Math.min(edge(top, v, u), bottom - 1);
+          if (drag.mode.includes("s")) bottom = Math.max(edge(bottom, v, u), top + 1);
+        }
+        if (upright()) {    // not past the picture's edges
+          left = Math.max(left, -c.x); right = Math.min(right, W - c.x);
+          top = Math.max(top, -c.y); bottom = Math.min(bottom, H - c.y);
+        }
+        if (lock.checked) {
+          // The edge being dragged sets the size, the screen's shape the other side.
+          if (drag.mode === "n" || drag.mode === "s") right = left + (bottom - top) / shape;
+          else if (drag.mode.includes("n")) top = bottom - (right - left) * shape;
+          else bottom = top + (right - left) * shape;
+        }
+        const w = right - left, h = bottom - top, mu = (left + right) / 2, mv = (top + bottom) / 2;
+        const mid = { x: c.x + u.x * mu + v.x * mv, y: c.y + u.y * mu + v.y * mv };
+        r = { x: mid.x - w / 2, y: mid.y - h / 2, w, h };
+      }
+      rect = fit(r);
+      render();
+    });
+    const done = () => {
+      if (!drag) return;
+      guides = [];
+      const before = drag.before;
+      if (!drag.moved) { drag = null; return; }
+      drag = null;
+      if (upright()) rect = whole(rect);
+      if (snapshot() !== before) { history.push(before); future.length = 0; }
+      render();
+    };
+    stage.addEventListener("pointerleave", () => { if (!drag) pointer.textContent = ""; });
+    stage.addEventListener("pointerup", done);
+    stage.addEventListener("pointercancel", done);
+    lock.addEventListener("change", () => { if (lock.checked && rect && !mapped) changing(() => { rect = screenShape(rect); if (upright()) rect = whole(rect); }); });
+
+    const apply = el("button", { class: "primary", onclick: busy(null, async () => {
+      if (!rect || mapped || snapshot() === start) return close();    // nothing changed: the part, or the map, as it was
+      if (upright()) {
+        const share = (value) => +value.toFixed(6);
+        await send({ part: [share(rect.x / W), share(rect.y / H), share((rect.x + rect.w) / W), share((rect.y + rect.h) / H)] });
+      } else {
+        await send({ map: toMap() });
+      }
+      close();
+    }, said) }, "Apply");
+    const field = (text, control) => el("label", { class: "field" }, el("span", {}, text), control);
+    frame();
+    return [[
+      stage, said, byHand,
+      el("div", { class: "fields tight" }, field("X (px)", inputs.x), field("Y (px)", inputs.y), field("Width (px)", inputs.w), field("Height (px)", inputs.h),
+        field("Rotation (°)", inputs.turn), el("label", { class: "check" }, lock, el("span", {}, "Keep the screen's shape"))),
+      el("div", { class: "button-row" },
+        undoButton, redoButton,
+        el("button", { class: "small", onclick: () => { if (W) changing(() => { mapped = false; turn = 0; rect = { x: 0, y: 0, w: W, h: H }; }); } }, "Whole Picture"),
+        el("button", { class: "small", onclick: () => { if (W && !mapped) changing(() => { rect = screenShape(rect); if (upright()) rect = whole(rect); }); } }, "Screen's Shape"),
+        el("button", { class: "small", onclick: () => { if (W && !mapped) changing(() => { turn = tidyTurn(turn + 90); rect = fit(rect); }); } }, "Rotate 90°"),
+        el("button", { class: "small", title: "The part's middle on the picture's middle", onclick: () => { if (W && !mapped) changing(() => { rect = fit({ ...rect, x: (W - rect.w) / 2, y: (H - rect.h) / 2 }); if (upright()) rect = whole(rect); }); } }, "Centre"),
+        el("button", { class: "small", title: "As it was when this window opened", onclick: () => { if (start && snapshot() !== start) changing(() => { ({ rect, turn, mapped } = JSON.parse(start)); }); } }, "Revert"),
+        live ? el("button", { class: "small", onclick: frame }, "New Frame") : null),
+      el("div", { class: "button-row" },
+        el("label", { class: "check" }, snapping, el("span", {}, "Snap to Edges")),
+        others.length ? el("label", { class: "check" }, showOthers, el("span", {}, `Show Other Screens on This ${live ? "Stream" : "Source"} (${others.length})`)) : null,
+        pointer),
+      facts,
+      el("p", { class: "help" }, `Drag on the picture to draw the part, inside it to move it, on its edges or corners to size it, and on the round handle to rotate it about its middle (with Shift, in steps of 15°). Edges snap to the picture's edges and middle and to the other screens' parts; hold Option (Alt) to place freely. Arrow keys move the part a pixel at a time, ten with Shift; ⌘Z undoes. X and Y are its top left corner before rotation. Pixels are the ${live ? "stream's" : "picture's"} own; the screen keeps the part as a share of the picture, so it holds if the size changes.`),
+    ], [el("button", { onclick: close }, "Cancel"), apply]];
+  }, { wide: true });
 }
 
 // Keeping a part of a recording as a recording of its own, to render that part alone.

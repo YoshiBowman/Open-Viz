@@ -473,3 +473,32 @@ footer .lines .note { color: var(--warn); }
 .row-item .thumb { width: 48px; height: 48px; flex-shrink: 0; display: grid; place-items: center; border-radius: var(--radius); background: var(--surface-2); color: var(--text-3); overflow: hidden; }
 .row-item .thumb svg { width: 22px; height: 22px; }
 .row-item .thumb img { width: 100%; height: 100%; object-fit: contain; background: #fff; }
+
+/* Choose Part: a screen's picture with the part it shows drawn on it. */
+.part-stage { position: relative; display: block; width: fit-content; max-width: 100%; margin: 0 auto 10px; line-height: 0; overflow: hidden;
+  background: #000; border-radius: var(--radius); cursor: crosshair; user-select: none; touch-action: none; }
+.part-stage img { display: block; max-width: 100%; max-height: 58vh; pointer-events: none; }
+.part-blank { width: min(820px, 80vw); background: repeating-linear-gradient(45deg, #15171c 0 12px, #1b1e24 12px 24px); }
+.part-box { position: absolute; border: 1.5px solid var(--accent); box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55); cursor: move; box-sizing: border-box; }
+.part-box .handle { position: absolute; width: 11px; height: 11px; background: var(--accent); border: 1px solid #000; border-radius: 2px; }
+.part-box .handle.nw { left: -6px; top: -6px; cursor: nwse-resize; }
+.part-box .handle.ne { right: -6px; top: -6px; cursor: nesw-resize; }
+.part-box .handle.sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.part-box .handle.se { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.part-box .handle.n { left: calc(50% - 6px); top: -6px; cursor: ns-resize; }
+.part-box .handle.s { left: calc(50% - 6px); bottom: -6px; cursor: ns-resize; }
+.part-box .handle.e { right: -6px; top: calc(50% - 6px); cursor: ew-resize; }
+.part-box .handle.w { left: -6px; top: calc(50% - 6px); cursor: ew-resize; }
+.part-map { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.part-map polygon { fill: rgba(242, 169, 59, 0.12); stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 6 4; }
+.part-box .handle.rot { left: calc(50% - 7px); top: 14px; width: 14px; height: 14px; border-radius: 50%; background: transparent; border: 2px solid var(--accent); cursor: grab; }
+.part-ghosts { position: absolute; inset: 0; pointer-events: none; }
+.part-ghosts svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.part-ghosts polygon { fill: none; stroke: rgba(255, 255, 255, 0.55); stroke-width: 1; stroke-dasharray: 3 3; }
+.part-ghost-name { position: absolute; transform: translate(-50%, -50%); font-size: 10px; line-height: 1.2; color: rgba(255, 255, 255, 0.8); background: rgba(0, 0, 0, 0.55); padding: 1px 4px; border-radius: 3px; white-space: nowrap; }
+.part-pointer { margin-left: auto; }
+.part-stage:focus { outline: none; }
+.part-stage:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.part-guides { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.part-guides line { stroke: var(--info); stroke-width: 1; }
+

@@ -1611,6 +1611,20 @@ namespace
 		}
 	}
 
+	// "map": [ox, oy, ux, uy, vx, vy], a part that is not upright in the picture.
+	void ReadMap(const FJsonObject& Object, bool& bOutMap, double OutMap[6])
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Numbers = nullptr;
+		if (Object.TryGetArrayField(TEXT("map"), Numbers) && Numbers->Num() == 6)
+		{
+			bOutMap = true;
+			for (int32 Index = 0; Index < 6; ++Index)
+			{
+				OutMap[Index] = (*Numbers)[Index].IsValid() ? (*Numbers)[Index]->AsNumber() : 0.0;
+			}
+		}
+	}
+
 	TArray<FLvScreenSetting> ReadScreenSettings(const FString& Path)
 	{
 		TArray<FLvScreenSetting> Settings;
@@ -1644,16 +1658,8 @@ namespace
 			Object.TryGetStringField(TEXT("value"), Setting.Value);
 			Object.TryGetNumberField(TEXT("nits"), Setting.Nits);
 			ReadPart(Object, Setting.Part);
+			ReadMap(Object, Setting.bMap, Setting.Map);
 			const TArray<TSharedPtr<FJsonValue>>* Numbers = nullptr;
-			// "map": [ox, oy, ux, uy, vx, vy], a part that is not upright in the picture.
-			if (Object.TryGetArrayField(TEXT("map"), Numbers) && Numbers->Num() == 6)
-			{
-				Setting.bMap = true;
-				for (int32 Index = 0; Index < 6; ++Index)
-				{
-					Setting.Map[Index] = (*Numbers)[Index].IsValid() ? (*Numbers)[Index]->AsNumber() : 0.0;
-				}
-			}
 			if (Object.TryGetArrayField(TEXT("face"), Numbers) && Numbers->Num() == 12)
 			{
 				Setting.bFace = true;
@@ -1688,6 +1694,7 @@ namespace
 						(*Described)->TryGetStringField(TEXT("value"), Section.Value);
 						(*Described)->TryGetNumberField(TEXT("nits"), Section.Nits);
 						ReadPart(**Described, Section.Part);
+						ReadMap(**Described, Section.bMap, Section.Map);
 					}
 					Setting.Sections.Add(MoveTemp(Section));
 				}
@@ -1979,7 +1986,9 @@ void ULvShowSubsystem::FollowScreensFile(UWorld& World)
 		for (int32 Piece = 0; Piece < Setting.Sections.Num(); ++Piece)
 		{
 			const FLvScreenSection& Section = Setting.Sections[Piece];
-			Wanted.Add(LvSectionId(Setting.Id, Piece).ToUpper(), FWanted{Section.Source, Section.Value, Section.Nits, Section.Part});
+			FWanted& One = Wanted.Add(LvSectionId(Setting.Id, Piece).ToUpper(), FWanted{Section.Source, Section.Value, Section.Nits, Section.Part});
+			One.bMap = Section.bMap;
+			FMemory::Memcpy(One.Map, Section.Map, sizeof(One.Map));
 		}
 	}
 	int32 Changed = 0;

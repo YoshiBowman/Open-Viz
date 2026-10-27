@@ -12,6 +12,11 @@ that misbehaves cannot take Openviz with it.
 
     python3 ndi_find.py                         lists what is there, by multicast DNS
     python3 ndi_find.py --library <libndi>      lists what NDI's own library finds
+    python3 ndi_find.py --library <libndi> --frame "NAME" --out frame.png
+                                                saves one frame of a stream, at its full size, as PNG
+
+A frame is what the Screens tab's Custom Crop shows to draw a screen's part of a stream on (owner,
+2026-10-27: "see a preview of the ndi feed and essentially draw out what part of it you want").
 """
 import json
 import os
@@ -19,7 +24,9 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -209,10 +216,138 @@ def _ask_library(library, seconds):
     return names
 
 
+def grab_with_library(library, name, seconds=6.0):
+    """One frame of the NDI stream `name` at its full size, received by NDI's own library in a process
+    of its own: (PNG bytes, width, height), or None with why: (None, reason)."""
+    handle, out = tempfile.mkstemp(suffix=".png", prefix="openviz-ndi-")
+    os.close(handle)
+    try:
+        done = subprocess.run([sys.executable, os.path.join(HERE, "ndi_find.py"), "--library", library, "--frame", name, "--seconds", str(seconds), "--out", out],
+                              capture_output=True, text=True, timeout=seconds + 20)
+        said = json.loads(done.stdout or "{}")
+        if not isinstance(said, dict) or not said.get("width"):
+            return None, (said.get("error") if isinstance(said, dict) else "") or "no frame arrived"
+        with open(out, "rb") as png:
+            return (png.read(), int(said["width"]), int(said["height"])), ""
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return None, str(error)
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def png_rgba(width, height, rgba):
+    """A PNG of `rgba` (width x height pixels, four bytes each, rows top down). Standard library only."""
+    stride = width * 4
+    rows = b"".join(b"\x00" + rgba[row * stride:(row + 1) * stride] for row in range(height))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 1)) + chunk(b"IEND", b""))
+
+
+def _fourcc(text):
+    return text[0] | text[1] << 8 | text[2] << 16 | text[3] << 24
+
+
+def _grab_library(library, name, seconds):
+    """What --frame does, in this process: {"width", "height", "png"} or {"error"}."""
+    import ctypes
+    ndi = ctypes.CDLL(library)
+    ndi.NDIlib_initialize.restype = ctypes.c_bool
+    if not ndi.NDIlib_initialize():
+        return {"error": "NDI's library would not start on this computer"}
+
+    class Source(ctypes.Structure):
+        _fields_ = [("p_ndi_name", ctypes.c_char_p), ("p_url_address", ctypes.c_char_p)]
+
+    class FindCreate(ctypes.Structure):
+        _fields_ = [("show_local_sources", ctypes.c_bool), ("p_groups", ctypes.c_char_p), ("p_extra_ips", ctypes.c_char_p)]
+
+    class RecvCreate(ctypes.Structure):
+        _fields_ = [("source_to_connect_to", Source), ("color_format", ctypes.c_int), ("bandwidth", ctypes.c_int),
+                    ("allow_video_fields", ctypes.c_bool), ("p_ndi_recv_name", ctypes.c_char_p)]
+
+    class VideoFrame(ctypes.Structure):
+        _fields_ = [("xres", ctypes.c_int), ("yres", ctypes.c_int), ("FourCC", ctypes.c_int), ("frame_rate_N", ctypes.c_int),
+                    ("frame_rate_D", ctypes.c_int), ("picture_aspect_ratio", ctypes.c_float), ("frame_format_type", ctypes.c_int),
+                    ("timecode", ctypes.c_int64), ("p_data", ctypes.POINTER(ctypes.c_uint8)), ("line_stride_in_bytes", ctypes.c_int),
+                    ("p_metadata", ctypes.c_char_p), ("timestamp", ctypes.c_int64)]
+
+    ndi.NDIlib_find_create_v2.restype = ctypes.c_void_p
+    ndi.NDIlib_find_create_v2.argtypes = [ctypes.POINTER(FindCreate)]
+    ndi.NDIlib_find_wait_for_sources.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    ndi.NDIlib_find_get_current_sources.restype = ctypes.POINTER(Source)
+    ndi.NDIlib_find_get_current_sources.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    ndi.NDIlib_find_destroy.argtypes = [ctypes.c_void_p]
+    ndi.NDIlib_recv_create_v3.restype = ctypes.c_void_p
+    ndi.NDIlib_recv_create_v3.argtypes = [ctypes.POINTER(RecvCreate)]
+    ndi.NDIlib_recv_capture_v2.restype = ctypes.c_int
+    ndi.NDIlib_recv_capture_v2.argtypes = [ctypes.c_void_p, ctypes.POINTER(VideoFrame), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+    ndi.NDIlib_recv_free_video_v2.argtypes = [ctypes.c_void_p, ctypes.POINTER(VideoFrame)]
+    ndi.NDIlib_recv_destroy.argtypes = [ctypes.c_void_p]
+
+    deadline = time.time() + seconds
+    finder = ndi.NDIlib_find_create_v2(ctypes.byref(FindCreate(True, None, None)))
+    if not finder:
+        return {"error": "NDI's library could not look for streams"}
+    receiver = None
+    try:
+        # The stream's address, as NDI's own search finds it.
+        wanted = name.encode("utf-8")
+        source = None
+        while time.time() < deadline and source is None:
+            ndi.NDIlib_find_wait_for_sources(finder, 500)
+            count = ctypes.c_uint32(0)
+            found = ndi.NDIlib_find_get_current_sources(finder, ctypes.byref(count))
+            for k in range(count.value):
+                if found[k].p_ndi_name == wanted:
+                    source = Source(found[k].p_ndi_name, found[k].p_url_address)
+        if source is None:
+            return {"error": f"{name} is not being sent on the network right now"}
+        # Full size (bandwidth highest), each pixel as R, G, B and A, so that pixels drawn on it are the stream's own.
+        receiver = ndi.NDIlib_recv_create_v3(ctypes.byref(RecvCreate(source, 2, 100, False, b"Openviz preview")))
+        if not receiver:
+            return {"error": "NDI's library could not receive the stream"}
+        frame = VideoFrame()
+        while time.time() < deadline:
+            if ndi.NDIlib_recv_capture_v2(receiver, ctypes.byref(frame), None, None, 1000) != 1:
+                continue
+            try:
+                width, height, stride = frame.xres, frame.yres, frame.line_stride_in_bytes
+                data = ctypes.string_at(frame.p_data, stride * height)
+                kind = frame.FourCC
+            finally:
+                ndi.NDIlib_recv_free_video_v2(receiver, ctypes.byref(frame))
+            rows = data if stride == width * 4 else b"".join(data[row * stride:row * stride + width * 4] for row in range(height))
+            pixels = bytearray(rows)
+            if kind in (_fourcc(b"BGRA"), _fourcc(b"BGRX")):
+                pixels[0::4], pixels[2::4] = pixels[2::4], pixels[0::4]
+            elif kind not in (_fourcc(b"RGBA"), _fourcc(b"RGBX")):
+                return {"error": "the stream came in a pixel format this preview does not read"}
+            pixels[3::4] = b"\xff" * (width * height)    # seen whole: what is see-through in the stream is shown as it lights
+            return {"width": width, "height": height, "png": png_rgba(width, height, bytes(pixels))}
+        return {"error": f"{name} sent no picture within {seconds:g} seconds"}
+    finally:
+        if receiver:
+            ndi.NDIlib_recv_destroy(receiver)
+        ndi.NDIlib_find_destroy(finder)
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--library":
         wait = float(sys.argv[sys.argv.index("--seconds") + 1]) if "--seconds" in sys.argv else 3.0
-        print(json.dumps(_ask_library(sys.argv[2], wait)))
+        if "--frame" in sys.argv:
+            grabbed = _grab_library(sys.argv[2], sys.argv[sys.argv.index("--frame") + 1], wait)
+            if "png" in grabbed:
+                with open(sys.argv[sys.argv.index("--out") + 1], "wb") as saved:
+                    saved.write(grabbed.pop("png"))
+            print(json.dumps(grabbed))
+        else:
+            print(json.dumps(_ask_library(sys.argv[2], wait)))
     else:
         for name in find(2.5, sys.argv[1:] or None):
             print(name)

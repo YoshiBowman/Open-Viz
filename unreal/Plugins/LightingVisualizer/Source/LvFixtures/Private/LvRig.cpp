@@ -672,6 +672,7 @@ TArray<ALvScreenActor*> LvRig::SpawnScreens(UWorld& World, const FString& MvrPat
 			{
 				Actor->Show(Section.Source, Section.Value, Section.Nits);
 				Actor->SetPart(Section.Part);
+				Actor->SetMap(Section.bMap, Section.Map);
 				Pieces.Add(Actor);
 				++OutReport.Sections;
 			}

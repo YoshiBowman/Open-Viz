@@ -349,6 +349,7 @@ class Launcher:
         self.app_path = os.environ.get("OPENVIZ_APP", "")
         self.app_pid = 0
         self._fetch_releases = lambda: updater.fetch_json(updater.RELEASES)    # the tests give a stand-in
+        self._grab_frame = ndi_find.grab_with_library    # one frame of an NDI stream: the tests give a stand-in
         self._update = {"checked": 0.0, "offer": None, "state": "idle", "message": ""}
 
     # ------------------------------------------------------------------------------- settings
@@ -1551,7 +1552,8 @@ class Launcher:
                     raise Problem("That screen section does not exist.")
                 content = cls._checked_screen(dict({"source": "pattern", "value": "", "nits": 1000.0}, **{key: section[key] for key in ("source", "value", "nits") if key in section}),
                                               added=False, files_must_exist=files_must_exist, wall=bool(more["replaces"]))
-                more["sections"].append(dict(content, part=cls._checked_part(section.get("part", [0, 0, 1, 1]))))
+                more["sections"].append(dict(content, part=cls._checked_part(section.get("part", [0, 0, 1, 1])),
+                                             **({"map": cls._checked_map(section["map"])} if section.get("map") is not None else {})))
             more["columns"], more["rows"] = columns, rows
         return more
 
@@ -1679,6 +1681,7 @@ class Launcher:
             judged(row)
             row["sections"] = [dict(section) for section in row["sections"]]
             for index, section in enumerate(row["sections"]):
+                section.setdefault("map", None)
                 judged(section)
                 section["own"] = self._own_part(row, index)    # the part of the screen's picture that falls on it
             # A screen in the place of fixtures: how many of them are still in the rig.
@@ -1751,6 +1754,43 @@ class Launcher:
             self._put_screen(path, changed)
         return self.screens(name)
 
+    PICTURE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".bmp": "image/bmp"}
+
+    def screen_preview(self, name, ident, section=None):
+        """What a screen, or one section of a split screen, shows, as a picture to draw its part on
+        (the Screens tab's Custom Crop): a frame of its NDI stream at the stream's own size, received
+        by NDI's library from the engine, or its still picture. Films have none yet."""
+        now = self._one_screen(name, ident)
+        target = now
+        if section is not None:
+            if not isinstance(section, int) or isinstance(section, bool) or not 0 <= section < len(now["sections"]):
+                raise Problem("This screen has no such section.")
+            target = now["sections"][section]
+        source, value = target["source"], target["value"]
+        if source == "ndi":
+            if not value:
+                raise Problem("Choose the NDI stream first.")
+            library = ndi_find.library_path(self.settings().get("engine"))
+            if not library:
+                raise Problem("NDI's library comes with Unreal Engine, which was not found: see Setup, under System.", code="no_ndi", status=404)
+            grabbed, why = self._grab_frame(library, value)
+            if not grabbed:
+                raise Problem(f"No picture came from {value}: {why}.", code="no_frame", status=404)
+            picture = PictureBytes(grabbed[0])
+            picture.content_type = "image/png"
+            return picture
+        if source == "picture":
+            kind = self.PICTURE_TYPES.get(os.path.splitext(value)[1].lower())
+            if not kind or not os.path.isfile(value):
+                raise Problem("The screen's picture is not there.", code="no_picture", status=404)
+            if os.path.getsize(value) > 64 << 20:
+                raise Problem("The picture is too large to show here.")
+            with open(value, "rb") as handle:
+                picture = PictureBytes(handle.read())
+            picture.content_type = kind
+            return picture
+        raise Problem("Only a still picture or an NDI stream can be shown here.", code="no_preview")
+
     def _one_screen(self, name, ident):
         """A screen of a show as it is now, with everything kept about it. Raises Problem if there is none."""
         path = self._show_path(name)
@@ -1760,7 +1800,8 @@ class Launcher:
         kept = next((row for row in self._screen_settings(path) if row["id"] == ident and row["added"] == now["added"]), None)
         now["face"] = kept["face"] if kept else None
         now["map"] = kept["map"] if kept else None
-        now["sections"] = [{key: section[key] for key in ("source", "value", "nits", "part")} for section in now["sections"]]
+        now["sections"] = [dict({key: section[key] for key in ("source", "value", "nits", "part")}, **({"map": section["map"]} if section.get("map") else {}))
+                           for section in now["sections"]]
         return now
 
     def _put_screen(self, path, changed):
@@ -1794,24 +1835,26 @@ class Launcher:
 
     def set_section(self, name, ident, index, changes):
         """Changes what one section of a split screen shows. `part` is "own" (the part of the
-        screen's picture that falls on it), "whole", or its four edges."""
+        screen's picture that falls on it), "whole", or its four edges; `map` a part at a rotation
+        in the picture, as a screen's, or None. A part given clears the map."""
         path = self._show_path(name)
         if not isinstance(ident, str) or not isinstance(changes, dict) or isinstance(index, bool) or not isinstance(index, int):
             raise Problem("Specify a screen section and the changes to make.")
-        if set(changes) - {"source", "value", "nits", "part"}:
+        if set(changes) - {"source", "value", "nits", "part", "map"}:
             raise Problem("Unknown screen section property.")
         with self._lock:
             now = self._one_screen(name, ident)
             if not 0 <= index < len(now["sections"]):
                 raise Problem("This screen has no such section.")
             section = now["sections"][index]
-            wanted = dict({key: section[key] for key in ("source", "value", "nits")}, **{key: value for key, value in changes.items() if key != "part"})
+            wanted = dict({key: section[key] for key in ("source", "value", "nits")}, **{key: value for key, value in changes.items() if key not in ("part", "map")})
             if "source" in changes and "value" not in changes and changes["source"] != section["source"]:
                 wanted["value"] = ""
             checked = self._checked_screen(wanted, added=False, wall=bool(now["replaces"]))
             part = changes.get("part", section["part"])
             part = self._own_part(now, index) if part == "own" else [0, 0, 1, 1] if part == "whole" else self._checked_part(part)
-            now["sections"][index] = dict(checked, part=part)
+            mapped = None if "part" in changes else self._checked_map(changes["map"]) if "map" in changes else section.get("map")
+            now["sections"][index] = dict(checked, part=part, **({"map": mapped} if mapped else {}))
             self._put_screen(path, now)
         return self.screens(name)
 
@@ -3136,28 +3179,53 @@ class Launcher:
 
     # ------------------------------------------------------------------------- building Unreal
 
+    SOURCE_ENDINGS = (".cpp", ".h", ".c", ".hpp", ".cs", ".inl")
+
     def visualizer_stale(self):
-        """Whether the visualizer's code (the plugin's sources, and the core's, which the plugin
-        compiles in) is newer than its build. (stale, the file that changed last, or why)."""
+        """Whether the visualizer's code is newer than its build, (stale, the file that changed last,
+        or why). Module by module, as Unreal's build decides: each module's sources against its own
+        built file (a module that did not change keeps its old file, so comparing everything with one
+        module's file said "stale" for ever after a build: found 2026-10-27), and the core's sources
+        against VizCore, which compiles them in."""
         project_dir = os.path.dirname(self.project)
-        binaries = os.path.join(project_dir, "Plugins", "LightingVisualizer", "Binaries")
-        built = [os.path.join(folder, entry) for folder, _, entries in os.walk(binaries) for entry in entries if "LvShow" in entry and not entry.endswith((".pdb", ".modules", ".target"))]
-        if not built:
+        plugin = os.path.join(project_dir, "Plugins", "LightingVisualizer")
+        built = {}    # module -> when its built file was written (the oldest, where there are several)
+        for folder, _, entries in os.walk(os.path.join(plugin, "Binaries")):
+            for entry in entries:
+                found = re.fullmatch(r"(?:lib)?UnrealEditor-(\w+?)(?:-\w+-\w+)?\.(?:dylib|dll|so)", entry)
+                if found:
+                    when = os.path.getmtime(os.path.join(folder, entry))
+                    built[found.group(1)] = min(built.get(found.group(1), when), when)
+        if "LvShow" not in built:
             return True, "it has not been built"
-        built_at = min(os.path.getmtime(path) for path in built)
-        newest, newest_at = None, 0.0
-        sources = [os.path.join(project_dir, "Plugins", "LightingVisualizer", "Source"), os.path.join(REPO, "core", "src"), os.path.join(REPO, "core", "include"),
-                   os.path.join(project_dir, "Plugins", "LightingVisualizer", "LightingVisualizer.uplugin")]
-        for source in sources:
-            files = [source] if os.path.isfile(source) else [os.path.join(folder, entry) for folder, _, entries in os.walk(source) for entry in entries]
-            for path in files:
-                if path.endswith((".cpp", ".h", ".c", ".hpp", ".cs", ".uplugin", ".inl")):
-                    when = os.path.getmtime(path)
-                    if when > newest_at:
-                        newest, newest_at = path, when
-        if newest and newest_at > built_at + 1.0:
-            return True, os.path.relpath(newest, REPO) if newest.startswith(REPO) else os.path.basename(newest)
-        return False, ""
+
+        def newest(paths):
+            best, best_at = None, 0.0
+            for root in paths:
+                for folder, _, entries in os.walk(root):
+                    for entry in entries:
+                        if entry.endswith(self.SOURCE_ENDINGS):
+                            path = os.path.join(folder, entry)
+                            when = os.path.getmtime(path)
+                            if when > best_at:
+                                best, best_at = path, when
+            return best, best_at
+
+        changed = []    # (when, file) of every module whose sources are newer than its build
+        source_root = os.path.join(plugin, "Source")
+        for module in sorted(os.listdir(source_root)) if os.path.isdir(source_root) else []:
+            if not os.path.isdir(os.path.join(source_root, module)):
+                continue
+            path, when = newest([os.path.join(source_root, module)])
+            if path and (module not in built or when > built[module] + 1.0):
+                changed.append((when, path))
+        path, when = newest([os.path.join(REPO, "core", "src"), os.path.join(REPO, "core", "include")])
+        if path and when > built.get("VizCore", built["LvShow"]) + 1.0:
+            changed.append((when, path))
+        if not changed:
+            return False, ""
+        path = max(changed)[1]
+        return True, os.path.relpath(path, REPO) if path.startswith(REPO) else os.path.basename(path)
 
     def build_visualizer(self, then=None, reason=""):
         """Builds the Unreal project in the background (the engine's own Build script), into
@@ -3227,7 +3295,9 @@ class Launcher:
     def _setup_facts(self, kind):
         built = self._visualizer_built()
         core = self.inspector if os.path.exists(self.inspector) else ""
-        return {"core": core, "core_error": "" if core else self._core_error, "built": built,
+        last = self._build or {}
+        build_error = last.get("error", "") if not last.get("running") and last.get("ok") is False else ""
+        return {"core": core, "core_error": "" if core else self._core_error, "built": built, "build_error": build_error,
                 "stale": list(self.visualizer_stale()) if built else [False, ""],
                 "git": os.path.isdir(os.path.join(REPO, ".git")), "epic_launcher": setup_check.epic_launcher(kind, self._setup_system),
                 "visual_studio": oslayer.visual_studio() if kind == "windows" else ""}
@@ -3255,7 +3325,11 @@ class Launcher:
             job = threading.Thread(target=self._build_core, daemon=True)
             job.start()
         elif key == "visualizer":
-            self.build_visualizer(reason="asked for under System, Setup")
+            try:
+                self.build_visualizer(reason="asked for under System, Setup")
+            except Problem as refused:
+                self._build = {"running": False, "ok": False, "error": str(refused), "started": int(time.time()), "reason": "", "log": "", "then": ""}
+                raise
             job = None
         else:
             command = setup_check.command_for(kind, key, self.settings()["engine"], self._setup_facts(kind), self._setup_system)
@@ -4434,6 +4508,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return launcher.screens(query.get("name", [""])[0])
             if path == "/api/osc":
                 return launcher.osc_state()
+            if path == "/api/screen/preview":
+                section = query.get("section", [""])[0]
+                return launcher.screen_preview(query.get("name", [""])[0], query.get("id", [""])[0], int(section) if section.isdigit() else None)
             if path == "/api/psn":
                 return launcher.psn_state()
             if path == "/api/paper":

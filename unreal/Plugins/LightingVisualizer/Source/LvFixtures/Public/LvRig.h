@@ -67,6 +67,9 @@ struct LVFIXTURES_API FLvScreenSection
 	float Nits = 1000.0f;
 	/** The part of its picture it shows: left, top, right, bottom, as shares of the whole. */
 	FVector4 Part = FVector4(0.0, 0.0, 1.0, 1.0);
+	/** Or a part at a rotation in the picture, as a screen's Map: used instead of Part. */
+	bool bMap = false;
+	double Map[6] = {0.0, 0.0, 1.0, 0.0, 0.0, 1.0};
 };
 
 struct LVFIXTURES_API FLvScreenSetting

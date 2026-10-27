@@ -190,9 +190,11 @@ def _common(system, kind, repo, engine, facts, before):
     built, stale = facts.get("built", False), facts.get("stale", [False, ""])
     current = built and not stale[0]
     tools_first = ["first_launch", "metal"] if kind == "mac" else ["visual_studio"]
-    out.append(_item("visualizer", "Visualizer", "Built once on this computer from Openviz's own sources.", current,
-                     "Built and up to date." if current else (f"Its code has changed since it was built ({stale[1]})." if built
-                                                             else "Not built yet: ten minutes to half an hour, once everything above is done."),
+    detail = "Built and up to date." if current else (f"Its code has changed since it was built ({stale[1]})." if built
+                                                     else "Not built yet: ten minutes to half an hour, once everything above is done.")
+    if not current and facts.get("build_error"):
+        detail = facts["build_error"]
+    out.append(_item("visualizer", "Visualizer", "Built once on this computer from Openviz's own sources.", current, detail,
                      ("Build Now", "build"), after=tools_first + ["engine"]))
     if facts.get("git"):
         code, said = system.run(["git", "lfs", "version"])
